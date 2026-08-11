@@ -1,0 +1,312 @@
+"""Native process identity primitives used by the Kanban attempt fence."""
+
+from __future__ import annotations
+
+import ctypes
+import json
+import os
+import socket
+import sqlite3
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+PROC_PIDTBSDINFO = 3
+MAXCOMLEN = 16
+MAX_CANONICAL_BOARD_DBS = 256
+
+
+class AttemptFenceCapabilityError(RuntimeError):
+    """The host cannot provide the native attempt-fence identity contract."""
+
+
+class AttemptFenceInventoryOverflow(RuntimeError):
+    """The canonical board inventory exceeded the fail-closed scan bound."""
+
+
+class StaleAttemptError(RuntimeError):
+    """A worker registration is ambiguous, stale, or internally inconsistent."""
+
+
+class ProcBSDInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * MAXCOMLEN),
+        ("pbi_name", ctypes.c_char * (2 * MAXCOMLEN)),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+@dataclass(frozen=True)
+class DarwinProcessIdentity:
+    pid: int
+    pgid: int
+    start_tvsec: int
+    start_tvusec: int
+
+    @property
+    def token(self) -> str:
+        return f"darwin:{self.pid}:{self.start_tvsec}:{self.start_tvusec}"
+
+
+@dataclass(frozen=True)
+class ProcessProvenance:
+    caller_pid: int
+    caller_pgid: int
+    caller_identity: DarwinProcessIdentity
+    leader_identity: DarwinProcessIdentity
+    board_db_path: str
+    task_id: str
+    run_id: int
+    claim_lock: str
+    raw_fence: str
+
+
+def _darwin_process_identity(pid: int) -> DarwinProcessIdentity | None:
+    """Return a PID identity tied to its microsecond process start time."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        proc_pidinfo = libproc.proc_pidinfo
+        proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        proc_pidinfo.restype = ctypes.c_int
+        info = ProcBSDInfo()
+        info_size = ctypes.sizeof(info)
+        returned = proc_pidinfo(
+            int(pid),
+            PROC_PIDTBSDINFO,
+            0,
+            ctypes.byref(info),
+            info_size,
+        )
+    except Exception:
+        # Identity discovery is a fail-closed probe. Every binding/kernel
+        # failure means "identity unavailable"; callers decide whether that
+        # is a no-registration result or a hard capability rejection.
+        return None
+    if returned != info_size or int(info.pbi_pid) != int(pid):
+        return None
+    return DarwinProcessIdentity(
+        pid=int(info.pbi_pid),
+        pgid=int(info.pbi_pgid),
+        start_tvsec=int(info.pbi_start_tvsec),
+        start_tvusec=int(info.pbi_start_tvusec),
+    )
+
+
+def _host_id() -> str:
+    """Return the host identifier persisted in a worker fence."""
+    try:
+        return socket.gethostname() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def _require_attempt_fence_platform() -> None:
+    """Fail before worker dispatch when native identity is unavailable."""
+    if sys.platform != "darwin":
+        raise AttemptFenceCapabilityError(
+            "worker attempt fencing requires macOS libproc"
+        )
+
+
+def _canonical_board_db_paths() -> list[Path]:
+    """Enumerate canonical board databases without consulting routing env."""
+    from hermes_cli import kanban_db as kb
+
+    root = Path(kb.kanban_home())
+    resolved_root = Path(str(root.resolve()))
+    candidates: list[Path] = [Path(str(root / "kanban.db"))]
+    boards = root / "kanban" / "boards"
+    if boards.is_dir():
+        for child in sorted(boards.iterdir(), key=lambda path: path.name):
+            if not child.is_dir():
+                continue
+            try:
+                slug = kb._normalize_board_slug(child.name)
+            except ValueError:
+                continue
+            if slug:
+                candidates.append(Path(str(child / "kanban.db")))
+    resolved_paths: set[Path] = set()
+    for path in candidates:
+        resolved = Path(str(path.resolve()))
+        try:
+            resolved.relative_to(resolved_root)
+        except ValueError:
+            continue
+        if resolved.is_file():
+            resolved_paths.add(resolved)
+    ordered_paths: list[Path] = []
+    for path in resolved_paths:
+        ordered_paths.append(path)
+    ordered_paths.sort(key=lambda path: path.as_posix())
+    return ordered_paths
+
+
+def _read_registration_rows(path: Path, caller_pgid: int) -> list[sqlite3.Row]:
+    uri = f"{path.as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(
+            """
+            SELECT t.id AS task_id,
+                   t.status AS task_status,
+                   t.current_run_id AS task_run_id,
+                   t.claim_lock AS task_claim_lock,
+                   t.worker_pid AS task_worker_pid,
+                   t.worker_pgid AS task_worker_pgid,
+                   t.worker_identity AS task_worker_identity,
+                   t.worker_fence AS task_worker_fence,
+                   r.id AS run_id,
+                   r.status AS run_status,
+                   r.claim_lock AS run_claim_lock,
+                   r.worker_pid AS run_worker_pid,
+                   r.worker_pgid AS run_worker_pgid,
+                   r.worker_identity AS run_worker_identity,
+                   r.worker_fence AS run_worker_fence
+              FROM tasks AS t
+              LEFT JOIN task_runs AS r ON r.id = t.current_run_id
+             WHERE t.worker_pgid = ? AND t.worker_fence IS NOT NULL
+            """,
+            (caller_pgid,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def _validated_provenance(
+    path: Path,
+    row: sqlite3.Row,
+    caller_identity: DarwinProcessIdentity,
+) -> ProcessProvenance:
+    required_fence_keys = {
+        "run_id",
+        "claim_lock",
+        "host",
+        "leader_pid",
+        "worker_pgid",
+        "worker_identity",
+        "reason",
+        "created_at",
+    }
+    raw_fence = row["task_worker_fence"]
+    try:
+        fence = json.loads(raw_fence)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise StaleAttemptError("worker fence is not valid JSON") from exc
+    if not isinstance(fence, dict) or set(fence) != required_fence_keys:
+        raise StaleAttemptError("worker fence has an invalid shape")
+    canonical = json.dumps(fence, sort_keys=True, separators=(",", ":"))
+    if canonical != raw_fence:
+        raise StaleAttemptError("worker fence is not canonical JSON")
+
+    task_run_id = row["task_run_id"]
+    task_claim_lock = row["task_claim_lock"]
+    task_worker_pid = row["task_worker_pid"]
+    task_worker_pgid = row["task_worker_pgid"]
+    task_worker_identity = row["task_worker_identity"]
+    copies_match = (
+        task_run_id is not None
+        and task_run_id == row["run_id"]
+        and task_claim_lock
+        and task_claim_lock == row["run_claim_lock"]
+        and task_worker_pid == row["run_worker_pid"]
+        and task_worker_pgid == row["run_worker_pgid"]
+        and task_worker_identity == row["run_worker_identity"]
+        and raw_fence == row["run_worker_fence"]
+        and row["task_status"] == "running"
+        and row["run_status"] == "running"
+    )
+    if not copies_match:
+        raise StaleAttemptError("task and run worker registrations differ")
+    fence_matches = (
+        fence["run_id"] == task_run_id
+        and fence["claim_lock"] == task_claim_lock
+        and fence["host"] == _host_id()
+        and fence["leader_pid"] == task_worker_pid
+        and fence["worker_pgid"] == task_worker_pgid
+        and fence["worker_identity"] == task_worker_identity
+        and isinstance(fence["reason"], str)
+        and bool(fence["reason"])
+        and isinstance(fence["created_at"], int)
+    )
+    if not fence_matches:
+        raise StaleAttemptError("worker fence does not match the active run")
+    leader_identity = _darwin_process_identity(int(task_worker_pid))
+    if (
+        leader_identity is None
+        or leader_identity.pgid != task_worker_pgid
+        or leader_identity.token != task_worker_identity
+    ):
+        raise StaleAttemptError("worker process identity is no longer current")
+    return ProcessProvenance(
+        caller_pid=caller_identity.pid,
+        caller_pgid=caller_identity.pgid,
+        caller_identity=caller_identity,
+        leader_identity=leader_identity,
+        board_db_path=str(path),
+        task_id=row["task_id"],
+        run_id=int(task_run_id),
+        claim_lock=str(task_claim_lock),
+        raw_fence=str(raw_fence),
+    )
+
+
+def _discover_current_worker_registration() -> ProcessProvenance | None:
+    """Scan canonical boards read-only; zero match means manual operator."""
+    _require_attempt_fence_platform()
+    caller_pid = os.getpid()
+    caller_pgid = os.getpgid(0)
+    caller_identity = _darwin_process_identity(caller_pid)
+    if caller_identity is None or caller_identity.pgid != caller_pgid:
+        raise StaleAttemptError("caller process identity is unavailable")
+    paths = _canonical_board_db_paths()
+    if len(paths) > MAX_CANONICAL_BOARD_DBS:
+        raise AttemptFenceInventoryOverflow(
+            f"canonical board inventory has {len(paths)} databases; "
+            f"maximum is {MAX_CANONICAL_BOARD_DBS}"
+        )
+    matches: list[tuple[Path, sqlite3.Row]] = []
+    try:
+        for path in paths:
+            matches.extend(
+                (path, row) for row in _read_registration_rows(path, caller_pgid)
+            )
+    except sqlite3.Error as exc:
+        raise StaleAttemptError("canonical board registration scan failed") from exc
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise StaleAttemptError(
+            "multiple worker registrations match this process group"
+        )
+    path, row = matches[0]
+    return _validated_provenance(path, row, caller_identity)

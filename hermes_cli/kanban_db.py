@@ -89,10 +89,26 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
+from hermes_cli.process_bootstrap import (
+    AttemptFenceCapabilityError,
+    AttemptFenceInventoryOverflow,
+    DarwinProcessIdentity,
+    ProcessProvenance,
+    StaleAttemptError,
+    _darwin_process_identity,
+    _discover_current_worker_registration,
+    _host_id,
+    _require_attempt_fence_platform,
+)
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
+
+
+def _identity_matches(expected: DarwinProcessIdentity) -> bool:
+    """Return whether ``expected`` still names the same live process."""
+    return _darwin_process_identity(expected.pid) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -1081,6 +1097,9 @@ class Task:
     # (Pre-rename column: ``spawn_failures``.)
     consecutive_failures: int = 0
     worker_pid: Optional[int] = None
+    worker_pgid: Optional[int] = None
+    worker_identity: Optional[str] = None
+    worker_fence: Optional[str] = None
     # Short excerpt of the last failure's error text (any outcome, not
     # just spawn). Pre-rename column: ``last_spawn_error``.
     last_failure_error: Optional[str] = None
@@ -1183,6 +1202,11 @@ class Task:
                 else (row["spawn_failures"] if "spawn_failures" in keys else 0)
             ),
             worker_pid=row["worker_pid"] if "worker_pid" in keys else None,
+            worker_pgid=row["worker_pgid"] if "worker_pgid" in keys else None,
+            worker_identity=(
+                row["worker_identity"] if "worker_identity" in keys else None
+            ),
+            worker_fence=row["worker_fence"] if "worker_fence" in keys else None,
             last_failure_error=(
                 row["last_failure_error"] if "last_failure_error" in keys
                 # Same belt-and-suspenders fallback as consecutive_failures above.
@@ -1257,6 +1281,9 @@ class Run:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     worker_pid: Optional[int]
+    worker_pgid: Optional[int]
+    worker_identity: Optional[str]
+    worker_fence: Optional[str]
     max_runtime_seconds: Optional[int]
     last_heartbeat_at: Optional[int]
     started_at: int
@@ -1281,6 +1308,13 @@ class Run:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             worker_pid=row["worker_pid"],
+            worker_pgid=row["worker_pgid"] if "worker_pgid" in row.keys() else None,
+            worker_identity=(
+                row["worker_identity"] if "worker_identity" in row.keys() else None
+            ),
+            worker_fence=(
+                row["worker_fence"] if "worker_fence" in row.keys() else None
+            ),
             max_runtime_seconds=row["max_runtime_seconds"],
             last_heartbeat_at=row["last_heartbeat_at"],
             started_at=int(row["started_at"]),
@@ -1359,6 +1393,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- exceeds DEFAULT_FAILURE_LIMIT consecutive non-successes.
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     worker_pid           INTEGER,
+    worker_pgid          INTEGER,
+    worker_identity      TEXT,
+    worker_fence         TEXT,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
@@ -1465,6 +1502,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    worker_pgid         INTEGER,
+    worker_identity     TEXT,
+    worker_fence        TEXT,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -2582,6 +2622,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             )
     if "worker_pid" not in cols:
         _add_column_if_missing(conn, "tasks", "worker_pid", "worker_pid INTEGER")
+    if "worker_pgid" not in cols:
+        _add_column_if_missing(conn, "tasks", "worker_pgid", "worker_pgid INTEGER")
+    if "worker_identity" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "worker_identity", "worker_identity TEXT"
+        )
+    if "worker_fence" not in cols:
+        _add_column_if_missing(conn, "tasks", "worker_fence", "worker_fence TEXT")
     if "last_failure_error" not in cols:
         added = _add_column_if_missing(
             conn, "tasks", "last_failure_error", "last_failure_error TEXT"
@@ -2693,6 +2741,29 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_worker_pgid ON tasks(worker_pgid)"
+    )
+
+    run_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    if run_table_exists:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        if "worker_pgid" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "worker_pgid", "worker_pgid INTEGER"
+            )
+        if "worker_identity" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "worker_identity", "worker_identity TEXT"
+            )
+        if "worker_fence" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "worker_fence", "worker_fence TEXT"
+            )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -2778,6 +2849,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         with write_txn(conn):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
+                "       worker_pgid, worker_identity, worker_fence, "
                 "       max_runtime_seconds, last_heartbeat_at, started_at "
                 "FROM tasks "
                 "WHERE status = 'running' AND current_run_id IS NULL"
@@ -2789,13 +2861,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                     INSERT INTO task_runs (
                         task_id, profile, status,
                         claim_lock, claim_expires, worker_pid,
+                        worker_pgid, worker_identity, worker_fence,
                         max_runtime_seconds, last_heartbeat_at,
                         started_at
-                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         row["id"], row["assignee"], row["claim_lock"],
                         row["claim_expires"], row["worker_pid"],
+                        row["worker_pgid"], row["worker_identity"],
+                        row["worker_fence"],
                         row["max_runtime_seconds"], row["last_heartbeat_at"],
                         started,
                     ),
@@ -2873,7 +2948,8 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, max_runtime_seconds INTEGER,"
+        " worker_pid INTEGER, worker_pgid INTEGER, worker_identity TEXT,"
+        " worker_fence TEXT, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
@@ -9835,6 +9911,8 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    if not dry_run:
+        _require_attempt_fence_platform()
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
