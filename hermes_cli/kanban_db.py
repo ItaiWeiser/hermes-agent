@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -87,7 +88,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Literal, Mapping, Optional
 
 from hermes_cli.process_bootstrap import (
     AttemptFenceCapabilityError,
@@ -117,6 +118,7 @@ def _identity_matches(expected: DarwinProcessIdentity) -> bool:
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+TERMINAL_FENCE_REAP_LIMIT = 16
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -4066,10 +4068,21 @@ def add_comment(
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
-        if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone():
+        task_row = conn.execute(
+            "SELECT status, current_run_id, worker_fence FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None:
             raise ValueError(f"unknown task {task_id}")
+        if task_row["worker_fence"] is not None:
+            ended = conn.execute(
+                "SELECT ended_at FROM task_runs WHERE id = ?",
+                (task_row["current_run_id"],),
+            ).fetchone()
+            if task_row["status"] != "running" or (ended and ended["ended_at"]):
+                raise StaleAttemptError(
+                    f"task {task_id} remains owned by an ended fenced attempt"
+                )
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)",
@@ -4432,9 +4445,12 @@ def _end_run(
                error         = ?,
                metadata      = ?,
                ended_at      = ?,
-               claim_lock    = NULL,
-               claim_expires = NULL,
-               worker_pid    = NULL
+               claim_lock    = CASE WHEN worker_fence IS NULL
+                                    THEN NULL ELSE claim_lock END,
+               claim_expires = CASE WHEN worker_fence IS NULL
+                                    THEN NULL ELSE claim_expires END,
+               worker_pid    = CASE WHEN worker_fence IS NULL
+                                    THEN NULL ELSE worker_pid END
          WHERE id = ?
            AND ended_at IS NULL
         """,
@@ -4449,9 +4465,202 @@ def _end_run(
         ),
     )
     conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+        "UPDATE tasks SET current_run_id = NULL "
+        "WHERE id = ? AND worker_fence IS NULL",
+        (task_id,),
     )
     return run_id
+
+
+def _fenced_group_state(fence: Mapping[str, Any]) -> Literal[
+    "alive", "dead", "unknown"
+]:
+    """Conservatively classify the process group named by a raw fence."""
+    leader_pid = fence.get("leader_pid")
+    worker_pgid = fence.get("worker_pgid")
+    worker_identity = fence.get("worker_identity")
+    stored_host = fence.get("host")
+    current_host = _host_id()
+    if (
+        isinstance(leader_pid, bool)
+        or not isinstance(leader_pid, int)
+        or leader_pid <= 0
+        or isinstance(worker_pgid, bool)
+        or not isinstance(worker_pgid, int)
+        or worker_pgid <= 0
+        or not isinstance(worker_identity, str)
+        or not worker_identity
+        or not isinstance(stored_host, str)
+        or not stored_host
+        or current_host is None
+        or stored_host != current_host
+    ):
+        return "unknown"
+
+    current = _darwin_process_identity(leader_pid)
+    if (
+        current is not None
+        and current.token == worker_identity
+        and current.pgid == worker_pgid
+    ):
+        return "alive"
+    try:
+        os.killpg(worker_pgid, 0)
+    except PermissionError:
+        return "unknown"
+    except ProcessLookupError:
+        return "dead"
+    except OSError as exc:
+        return "dead" if exc.errno == errno.ESRCH else "unknown"
+    return "alive"
+
+
+class _FenceReapCasLost(RuntimeError):
+    """Internal signal used to roll back a two-row fence reap CAS."""
+
+
+def _decoded_fence(raw_fence: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(raw_fence, str) or not raw_fence:
+        return None
+    try:
+        decoded = json.loads(raw_fence)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _recorded_retry_status(run: Mapping[str, Any]) -> Optional[str]:
+    if run["outcome"] in {"completed", "blocked", "gave_up"}:
+        return None
+    try:
+        metadata = json.loads(run["metadata"]) if run["metadata"] else {}
+    except (json.JSONDecodeError, TypeError):
+        return None
+    retry_status = metadata.get("retry_status") if isinstance(metadata, dict) else None
+    return retry_status if retry_status in {"todo", "ready", "review"} else None
+
+
+def reap_terminal_attempt_fences(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = TERMINAL_FENCE_REAP_LIMIT,
+) -> list[tuple[Literal["task", "run"], str | int]]:
+    """Reap at most ``limit`` proven-dead terminal attempt fences once."""
+    bounded_limit = max(0, min(int(limit), TERMINAL_FENCE_REAP_LIMIT))
+    if bounded_limit == 0:
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    task_rows = conn.execute(
+        """
+        SELECT 'task' AS owner_kind, t.id AS owner_id, t.id AS task_id,
+               r.id AS run_id, t.worker_pid, t.worker_pgid,
+               t.worker_identity, t.worker_fence, r.outcome, r.metadata
+          FROM tasks t
+          JOIN task_runs r ON r.id = t.current_run_id
+         WHERE t.worker_fence IS NOT NULL
+           AND (t.status <> 'running' OR r.ended_at IS NOT NULL)
+         ORDER BY t.id
+         LIMIT ?
+        """,
+        (bounded_limit,),
+    ).fetchall()
+    candidates.extend(dict(row) for row in task_rows)
+
+    remaining = bounded_limit - len(candidates)
+    if remaining:
+        orphan_rows = conn.execute(
+            """
+            SELECT 'run' AS owner_kind, r.id AS owner_id, r.task_id,
+                   r.id AS run_id, r.worker_pid, r.worker_pgid,
+                   r.worker_identity, r.worker_fence, r.outcome, r.metadata
+              FROM task_runs r
+              LEFT JOIN tasks t ON t.id = r.task_id
+             WHERE r.worker_fence IS NOT NULL
+               AND (t.current_run_id IS NULL OR t.current_run_id <> r.id)
+               AND CASE WHEN json_valid(r.worker_fence)
+                        THEN json_extract(r.worker_fence, '$.reason')
+                        ELSE NULL END = 'spawn_bind_failed'
+             ORDER BY r.id
+             LIMIT ?
+            """,
+            (remaining,),
+        ).fetchall()
+        candidates.extend(dict(row) for row in orphan_rows)
+
+    reaped: list[tuple[Literal["task", "run"], str | int]] = []
+    for candidate in candidates:
+        fence = _decoded_fence(candidate["worker_fence"])
+        if fence is None or _fenced_group_state(fence) != "dead":
+            continue
+        exact = (
+            candidate["worker_fence"],
+            candidate["worker_pid"],
+            candidate["worker_pgid"],
+            candidate["worker_identity"],
+        )
+        if candidate["owner_kind"] == "run":
+            with write_txn(conn):
+                cur = conn.execute(
+                    """
+                    UPDATE task_runs
+                       SET claim_lock=NULL, claim_expires=NULL,
+                           worker_pid=NULL, worker_pgid=NULL,
+                           worker_identity=NULL, worker_fence=NULL
+                     WHERE id=? AND worker_fence=? AND worker_pid IS ?
+                       AND worker_pgid IS ? AND worker_identity IS ?
+                    """,
+                    (candidate["run_id"], *exact),
+                )
+            if cur.rowcount == 1:
+                reaped.append(("run", int(candidate["run_id"])))
+            continue
+
+        retry_status = _recorded_retry_status(candidate)
+        try:
+            with write_txn(conn):
+                task_cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status=COALESCE(?, status), current_run_id=NULL,
+                           claim_lock=NULL, claim_expires=NULL,
+                           worker_pid=NULL, worker_pgid=NULL,
+                           worker_identity=NULL, worker_fence=NULL
+                     WHERE id=? AND current_run_id=? AND worker_fence=?
+                       AND worker_pid IS ? AND worker_pgid IS ?
+                       AND worker_identity IS ?
+                    """,
+                    (
+                        retry_status,
+                        candidate["task_id"],
+                        candidate["run_id"],
+                        *exact,
+                    ),
+                )
+                if task_cur.rowcount != 1:
+                    raise _FenceReapCasLost
+                run_cur = conn.execute(
+                    """
+                    UPDATE task_runs
+                       SET claim_lock=NULL, claim_expires=NULL,
+                           worker_pid=NULL, worker_pgid=NULL,
+                           worker_identity=NULL, worker_fence=NULL
+                     WHERE id=? AND task_id=? AND worker_fence=?
+                       AND worker_pid IS ? AND worker_pgid IS ?
+                       AND worker_identity IS ?
+                    """,
+                    (
+                        candidate["run_id"],
+                        candidate["task_id"],
+                        *exact,
+                    ),
+                )
+                if run_cur.rowcount != 1:
+                    raise _FenceReapCasLost
+        except _FenceReapCasLost:
+            continue
+        reaped.append(("task", str(candidate["task_id"])))
+    return reaped
 
 
 def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
@@ -4706,6 +4915,12 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        fenced = conn.execute(
+            "SELECT worker_fence FROM tasks WHERE id = ? AND status = 'ready'",
+            (task_id,),
+        ).fetchone()
+        if fenced is not None and fenced["worker_fence"] is not None:
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4761,6 +4976,7 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
+               AND worker_fence IS NULL
             """,
             (lock, expires, now, task_id),
         )
@@ -4834,6 +5050,12 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        fenced = conn.execute(
+            "SELECT worker_fence FROM tasks WHERE id = ? AND status = 'review'",
+            (task_id,),
+        ).fetchone()
+        if fenced is not None and fenced["worker_fence"] is not None:
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -4861,6 +5083,7 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
+               AND worker_fence IS NULL
             """,
             (lock, expires, now, task_id),
         )
@@ -5020,6 +5243,79 @@ def heartbeat_claim(
         return False
 
 
+def _reclaim_proven_dead_fenced_attempt(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    retry_status: str,
+    error: str,
+    payload: dict[str, Any],
+) -> bool:
+    """Atomically close and clear one exact, proven-dead fenced attempt."""
+    now = int(time.time())
+    exact = (
+        row["worker_fence"],
+        row["worker_pid"],
+        row["worker_pgid"],
+        row["worker_identity"],
+    )
+    try:
+        with write_txn(conn):
+            run_cur = conn.execute(
+                """
+                UPDATE task_runs
+                   SET status='reclaimed', outcome='reclaimed', error=?,
+                       metadata=?, ended_at=COALESCE(ended_at, ?),
+                       claim_lock=NULL, claim_expires=NULL,
+                       worker_pid=NULL, worker_pgid=NULL,
+                       worker_identity=NULL, worker_fence=NULL
+                 WHERE id=? AND task_id=? AND worker_fence=?
+                   AND worker_pid IS ? AND worker_pgid IS ?
+                   AND worker_identity IS ?
+                """,
+                (
+                    error[:500],
+                    json.dumps(payload, ensure_ascii=False),
+                    now,
+                    row["current_run_id"],
+                    row["id"],
+                    *exact,
+                ),
+            )
+            if run_cur.rowcount != 1:
+                raise _FenceReapCasLost
+            task_cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status=?, current_run_id=NULL,
+                       claim_lock=NULL, claim_expires=NULL,
+                       worker_pid=NULL, worker_pgid=NULL,
+                       worker_identity=NULL, worker_fence=NULL
+                 WHERE id=? AND current_run_id=? AND worker_fence=?
+                   AND worker_pid IS ? AND worker_pgid IS ?
+                   AND worker_identity IS ?
+                """,
+                (
+                    retry_status,
+                    row["id"],
+                    row["current_run_id"],
+                    *exact,
+                ),
+            )
+            if task_cur.rowcount != 1:
+                raise _FenceReapCasLost
+            _append_event(
+                conn,
+                row["id"],
+                "reclaimed",
+                payload,
+                run_id=int(row["current_run_id"]),
+            )
+    except _FenceReapCasLost:
+        return False
+    return True
+
+
 def release_stale_claims(
     conn: sqlite3.Connection,
     *,
@@ -5054,14 +5350,46 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "SELECT id, current_run_id, claim_lock, worker_pid, worker_pgid, "
+        "worker_identity, worker_fence, claim_expires, last_heartbeat_at, "
+        "assignee, "
+        "(SELECT ended_at FROM task_runs WHERE id=current_run_id) "
+        "AS run_ended_at "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
         (now,),
     ).fetchall()
     for row in stale:
+        if row["worker_fence"] is not None:
+            if row["run_ended_at"] is not None:
+                continue
+            fence = _decoded_fence(row["worker_fence"])
+            if fence is None or _fenced_group_state(fence) != "dead":
+                continue
+            retry_status = _retry_status_for_run(
+                conn,
+                row["id"],
+                row["current_run_id"],
+            )
+            payload = {
+                "stale_lock": row["claim_lock"],
+                "worker_pid": row["worker_pid"],
+                "claim_expires": int(row["claim_expires"]),
+                "last_heartbeat_at": row["last_heartbeat_at"],
+                "now": now,
+                "retry_status": retry_status,
+                "group_state": "dead",
+            }
+            if _reclaim_proven_dead_fenced_attempt(
+                conn,
+                row,
+                retry_status=retry_status,
+                error=f"stale_lock={row['claim_lock']}",
+                payload=payload,
+            ):
+                reclaimed += 1
+            continue
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
         hb = row["last_heartbeat_at"]
@@ -5206,7 +5534,11 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT id, status, current_run_id, claim_lock, worker_pid, "
+        "worker_pgid, worker_identity, worker_fence, "
+        "(SELECT ended_at FROM task_runs WHERE id=current_run_id) "
+        "AS run_ended_at "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -5214,6 +5546,36 @@ def reclaim_task(
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
+    if row["worker_fence"] is not None:
+        if row["status"] != "running" or row["run_ended_at"] is not None:
+            return False
+        if not isinstance(reason, str) or not reason.strip():
+            return False
+        fence = _decoded_fence(row["worker_fence"])
+        if fence is None or _fenced_group_state(fence) != "dead":
+            return False
+        retry_status = _retry_status_for_run(
+            conn,
+            task_id,
+            row["current_run_id"],
+        )
+        payload = {
+            "manual": True,
+            "reason": reason.strip(),
+            "prev_lock": row["claim_lock"],
+            "retry_status": retry_status,
+            "group_state": "dead",
+        }
+        if not _reclaim_proven_dead_fenced_attempt(
+            conn,
+            row,
+            retry_status=retry_status,
+            error=f"manual_reclaim: {reason.strip()}",
+            payload=payload,
+        ):
+            return False
+        _clear_failure_counter(conn, task_id)
+        return True
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
@@ -5278,8 +5640,24 @@ def reassign_task(
     unassign entirely.
     """
     if reclaim_first:
+        target = conn.execute(
+            "SELECT worker_fence FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if (
+            target is not None
+            and target["worker_fence"] is not None
+            and (not isinstance(reason, str) or not reason.strip())
+        ):
+            return False
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
+        still_fenced = conn.execute(
+            "SELECT worker_fence FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if still_fenced is not None and still_fenced["worker_fence"] is not None:
+            return False
     # assign_task handles its own txn + the still-running guard.
     try:
         return assign_task(conn, task_id, profile)
@@ -5522,9 +5900,12 @@ def complete_task(
                    SET status       = 'done',
                        result       = ?,
                        completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
+                       claim_lock   = CASE WHEN worker_fence IS NULL
+                                           THEN NULL ELSE claim_lock END,
+                       claim_expires= CASE WHEN worker_fence IS NULL
+                                           THEN NULL ELSE claim_expires END,
+                       worker_pid   = CASE WHEN worker_fence IS NULL
+                                           THEN NULL ELSE worker_pid END,
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
@@ -5539,9 +5920,12 @@ def complete_task(
                    SET status       = 'done',
                        result       = ?,
                        completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
+                       claim_lock   = CASE WHEN worker_fence IS NULL
+                                           THEN NULL ELSE claim_lock END,
+                       claim_expires= CASE WHEN worker_fence IS NULL
+                                           THEN NULL ELSE claim_expires END,
+                       worker_pid   = CASE WHEN worker_fence IS NULL
+                                           THEN NULL ELSE worker_pid END,
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
@@ -6388,9 +6772,12 @@ def block_task(
                 """
                 UPDATE tasks
                    SET status        = 'todo',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
+                       claim_lock    = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE claim_lock END,
+                       claim_expires = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE claim_expires END,
+                       worker_pid    = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE worker_pid END,
                        block_kind    = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
@@ -6445,9 +6832,12 @@ def block_task(
                 """
                 UPDATE tasks
                    SET status        = 'triage',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
+                       claim_lock    = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE claim_lock END,
+                       claim_expires = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE claim_expires END,
+                       worker_pid    = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE worker_pid END,
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
@@ -6484,9 +6874,12 @@ def block_task(
                     """
                     UPDATE tasks
                        SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
+                       claim_lock    = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE claim_lock END,
+                       claim_expires = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE claim_expires END,
+                       worker_pid    = CASE WHEN worker_fence IS NULL
+                                            THEN NULL ELSE worker_pid END,
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
@@ -6499,9 +6892,12 @@ def block_task(
                     """
                     UPDATE tasks
                        SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
+                           claim_lock    = CASE WHEN worker_fence IS NULL
+                                                THEN NULL ELSE claim_lock END,
+                           claim_expires = CASE WHEN worker_fence IS NULL
+                                                THEN NULL ELSE claim_expires END,
+                           worker_pid    = CASE WHEN worker_fence IS NULL
+                                                THEN NULL ELSE worker_pid END,
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
@@ -6603,7 +6999,7 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, status, claim_lock, current_run_id, worker_fence "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -6677,10 +7073,14 @@ def request_review(
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'review',
-                   claim_lock    = NULL,
-                   claim_expires = NULL,
-                   worker_pid    = NULL
+               SET status        = CASE WHEN worker_fence IS NULL
+                                         THEN 'review' ELSE status END,
+                   claim_lock    = CASE WHEN worker_fence IS NULL
+                                        THEN NULL ELSE claim_lock END,
+                   claim_expires = CASE WHEN worker_fence IS NULL
+                                        THEN NULL ELSE claim_expires END,
+                   worker_pid    = CASE WHEN worker_fence IS NULL
+                                        THEN NULL ELSE worker_pid END
             """ + assignee_sql + """
              WHERE id = ?
                AND status IN ('running', 'ready')
@@ -6693,13 +7093,17 @@ def request_review(
                 "task is not in running/ready (or expected_run_id did not "
                 "match the current run)",
             )
+        run_metadata = metadata
+        if trow["worker_fence"] is not None:
+            run_metadata = dict(metadata or {})
+            run_metadata["retry_status"] = "review"
         run_id = _end_run(
             conn,
             task_id,
             outcome="review_requested",
             status="review",
             summary=summary,
-            metadata=metadata,
+            metadata=run_metadata,
         )
         if run_id is None and (summary or metadata):
             run_id = _synthesize_ended_run(
@@ -6746,7 +7150,8 @@ def request_changes(
 
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, assignee, current_run_id, worker_fence "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if task_row is None:
@@ -6811,11 +7216,14 @@ def request_changes(
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status = ?,
+               SET status = CASE WHEN worker_fence IS NULL THEN ? ELSE status END,
                    assignee = COALESCE(?, assignee),
-                   claim_lock = NULL,
-                   claim_expires = NULL,
-                   worker_pid = NULL
+                   claim_lock = CASE WHEN worker_fence IS NULL
+                                     THEN NULL ELSE claim_lock END,
+                   claim_expires = CASE WHEN worker_fence IS NULL
+                                        THEN NULL ELSE claim_expires END,
+                   worker_pid = CASE WHEN worker_fence IS NULL
+                                     THEN NULL ELSE worker_pid END
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
             (new_status, implementer, task_id, int(current_run_id)),
@@ -6828,6 +7236,11 @@ def request_changes(
             outcome="changes_requested",
             status=new_status,
             summary=reason,
+            metadata=(
+                {"retry_status": new_status}
+                if task_row["worker_fence"] is not None
+                else None
+            ),
         )
         _append_event(
             conn,
@@ -8526,7 +8939,7 @@ def enforce_max_runtime(
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
-        "  AND t.worker_pid IS NOT NULL"
+        "  AND t.worker_pid IS NOT NULL AND t.worker_fence IS NULL"
     ).fetchall()
     for row in rows:
         lock = row["claim_lock"] or ""
@@ -8574,7 +8987,8 @@ def enforce_max_runtime(
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
+                "  AND worker_pid = ? AND claim_lock IS ? "
+                "  AND worker_fence IS NULL",
                 (retry_status, tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
@@ -8663,7 +9077,7 @@ def detect_stale_running(
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running'"
+        "WHERE t.status = 'running' AND t.worker_fence IS NULL"
     ).fetchall()
 
     for row in rows:
@@ -8705,7 +9119,7 @@ def detect_stale_running(
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
+                "  AND claim_lock IS ? AND worker_fence IS NULL",
                 (retry_status, tid, row["claim_lock"]),
             )
             if cur.rowcount != 1:
@@ -8782,7 +9196,8 @@ def reconcile_orphaned_running(
     rows = conn.execute(
         "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
         "WHERE status = 'running' "
-        "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
+        "  AND (claim_lock IS NULL OR claim_expires IS NULL) "
+        "  AND worker_fence IS NULL"
     ).fetchall()
     for row in rows:
         tid = row["id"]
@@ -8801,7 +9216,8 @@ def reconcile_orphaned_running(
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ? AND claim_expires IS ?",
+                "  AND claim_lock IS ? AND claim_expires IS ? "
+                "  AND worker_fence IS NULL",
                 (tid, row["claim_lock"], row["claim_expires"]),
             )
             if cur.rowcount != 1:
@@ -8970,7 +9386,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at, assignee "
             "FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "WHERE status = 'running' AND worker_pid IS NOT NULL "
+            "AND worker_fence IS NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -9059,7 +9476,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
+                "  AND worker_pid = ? AND claim_lock IS ? "
+                "  AND worker_fence IS NULL",
                 (retry_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
@@ -9314,8 +9732,13 @@ def _record_task_failure(
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
+                    "UPDATE tasks SET status = 'blocked', "
+                    "claim_lock = CASE WHEN worker_fence IS NULL "
+                    "THEN NULL ELSE claim_lock END, "
+                    "claim_expires = CASE WHEN worker_fence IS NULL "
+                    "THEN NULL ELSE claim_expires END, "
+                    "worker_pid = CASE WHEN worker_fence IS NULL "
+                    "THEN NULL ELSE worker_pid END, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready', 'review')",
                     (failures, error[:500], task_id),
@@ -9364,8 +9787,14 @@ def _record_task_failure(
             if release_claim:
                 # Spawn path: restore the claimed source phase + clear claim.
                 conn.execute(
-                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
+                    "UPDATE tasks SET status = CASE WHEN worker_fence IS NULL "
+                    "THEN ? ELSE status END, "
+                    "claim_lock = CASE WHEN worker_fence IS NULL "
+                    "THEN NULL ELSE claim_lock END, "
+                    "claim_expires = CASE WHEN worker_fence IS NULL "
+                    "THEN NULL ELSE claim_expires END, "
+                    "worker_pid = CASE WHEN worker_fence IS NULL "
+                    "THEN NULL ELSE worker_pid END, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
                     (retry_status, failures, error[:500], task_id),
@@ -10018,6 +10447,8 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+    if not dry_run:
+        reap_terminal_attempt_fences(conn)
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
