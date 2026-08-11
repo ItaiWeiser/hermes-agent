@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import sqlite3
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -120,12 +121,15 @@ def _darwin_process_identity(pid: int) -> DarwinProcessIdentity | None:
     )
 
 
-def _host_id() -> str:
+def _host_id() -> str | None:
     """Return the host identifier persisted in a worker fence."""
     try:
-        return socket.gethostname() or "unknown"
+        host = socket.gethostname().strip()
     except OSError:
-        return "unknown"
+        return None
+    if not host or host.casefold() == "unknown":
+        return None
+    return host
 
 
 def _require_attempt_fence_platform() -> None:
@@ -141,12 +145,31 @@ def _canonical_board_db_paths() -> list[Path]:
     from hermes_cli import kanban_db as kb
 
     root = Path(kb.kanban_home())
-    resolved_root = Path(str(root.resolve()))
+    try:
+        resolved_root = Path(str(root.resolve()))
+    except OSError as exc:
+        raise StaleAttemptError("canonical board root cannot be resolved") from exc
     candidates: list[Path] = [Path(str(root / "kanban.db"))]
     boards = root / "kanban" / "boards"
-    if boards.is_dir():
-        for child in sorted(boards.iterdir(), key=lambda path: path.name):
-            if not child.is_dir():
+    try:
+        boards_mode = boards.stat().st_mode
+    except FileNotFoundError:
+        boards_mode = None
+    except OSError as exc:
+        raise StaleAttemptError("canonical board directory is unreadable") from exc
+    if boards_mode is not None:
+        if not stat.S_ISDIR(boards_mode):
+            raise StaleAttemptError("canonical board path is not a directory")
+        try:
+            children = sorted(boards.iterdir(), key=lambda path: path.name)
+        except OSError as exc:
+            raise StaleAttemptError("canonical board directory listing failed") from exc
+        for child in children:
+            try:
+                child_mode = child.stat().st_mode
+            except OSError as exc:
+                raise StaleAttemptError("canonical board entry is unreadable") from exc
+            if not stat.S_ISDIR(child_mode):
                 continue
             try:
                 slug = kb._normalize_board_slug(child.name)
@@ -156,13 +179,23 @@ def _canonical_board_db_paths() -> list[Path]:
                 candidates.append(Path(str(child / "kanban.db")))
     resolved_paths: set[Path] = set()
     for path in candidates:
-        resolved = Path(str(path.resolve()))
+        try:
+            resolved = Path(str(path.resolve()))
+        except OSError as exc:
+            raise StaleAttemptError("canonical board DB cannot be resolved") from exc
         try:
             resolved.relative_to(resolved_root)
         except ValueError:
             continue
-        if resolved.is_file():
-            resolved_paths.add(resolved)
+        try:
+            resolved_mode = resolved.stat().st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise StaleAttemptError("canonical board DB is unreadable") from exc
+        if not stat.S_ISREG(resolved_mode):
+            raise StaleAttemptError("canonical board DB is not a regular file")
+        resolved_paths.add(resolved)
     ordered_paths: list[Path] = []
     for path in resolved_paths:
         ordered_paths.append(path)
@@ -186,6 +219,7 @@ def _read_registration_rows(path: Path, caller_pgid: int) -> list[sqlite3.Row]:
                    t.worker_identity AS task_worker_identity,
                    t.worker_fence AS task_worker_fence,
                    r.id AS run_id,
+                   r.task_id AS run_task_id,
                    r.status AS run_status,
                    r.claim_lock AS run_claim_lock,
                    r.worker_pid AS run_worker_pid,
@@ -236,6 +270,7 @@ def _validated_provenance(
     copies_match = (
         task_run_id is not None
         and task_run_id == row["run_id"]
+        and row["run_task_id"] == row["task_id"]
         and task_claim_lock
         and task_claim_lock == row["run_claim_lock"]
         and task_worker_pid == row["run_worker_pid"]
@@ -247,10 +282,13 @@ def _validated_provenance(
     )
     if not copies_match:
         raise StaleAttemptError("task and run worker registrations differ")
+    current_host = _host_id()
+    if current_host is None:
+        raise StaleAttemptError("host identity is unavailable")
     fence_matches = (
         fence["run_id"] == task_run_id
         and fence["claim_lock"] == task_claim_lock
-        and fence["host"] == _host_id()
+        and fence["host"] == current_host
         and fence["leader_pid"] == task_worker_pid
         and fence["worker_pgid"] == task_worker_pgid
         and fence["worker_identity"] == task_worker_identity

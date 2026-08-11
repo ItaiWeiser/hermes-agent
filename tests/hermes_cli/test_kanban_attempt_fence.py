@@ -1,6 +1,8 @@
+import json
 import os
 import sqlite3
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -51,6 +53,16 @@ def test_libproc_identity_returns_none_on_binding_error(monkeypatch):
 
     monkeypatch.setattr(process_bootstrap.ctypes, "CDLL", fail_to_load)
     assert process_bootstrap._darwin_process_identity(os.getpid()) is None
+
+
+def test_host_identity_returns_none_on_hostname_failure(monkeypatch):
+    from hermes_cli import process_bootstrap
+
+    def fail_hostname():
+        raise OSError("hostname unavailable")
+
+    monkeypatch.setattr(process_bootstrap.socket, "gethostname", fail_hostname)
+    assert process_bootstrap._host_id() is None
 
 
 def test_non_darwin_dispatch_fails_before_claim_with_zero_delta(
@@ -121,8 +133,163 @@ def test_registration_discovery_rejects_task_run_fence_mismatch(
         (fixture.claimed.current_run_id,),
     )
     fixture.conn.commit()
+    before = logical_board_snapshot(fixture.conn)
     with pytest.raises(kb.StaleAttemptError):
         kb._discover_current_worker_registration()
+    assert logical_board_snapshot(fixture.conn) == before
+
+
+@darwin_only
+def test_registration_discovery_rejects_claim_mismatch_with_zero_delta(
+    registered_current_process,
+):
+    fixture = registered_current_process
+    fixture.conn.execute(
+        "UPDATE tasks SET claim_lock='stale:claim' WHERE id=?",
+        (fixture.task_id,),
+    )
+    fixture.conn.execute(
+        "UPDATE task_runs SET claim_lock='stale:claim' WHERE id=?",
+        (fixture.claimed.current_run_id,),
+    )
+    fixture.conn.commit()
+    before = logical_board_snapshot(fixture.conn)
+    with pytest.raises(kb.StaleAttemptError):
+        kb._discover_current_worker_registration()
+    assert logical_board_snapshot(fixture.conn) == before
+
+
+@darwin_only
+def test_registration_discovery_rejects_terminal_status_with_zero_delta(
+    registered_current_process,
+):
+    fixture = registered_current_process
+    fixture.conn.execute(
+        "UPDATE tasks SET status='done' WHERE id=?",
+        (fixture.task_id,),
+    )
+    fixture.conn.execute(
+        "UPDATE task_runs SET status='done' WHERE id=?",
+        (fixture.claimed.current_run_id,),
+    )
+    fixture.conn.commit()
+    before = logical_board_snapshot(fixture.conn)
+    with pytest.raises(kb.StaleAttemptError):
+        kb._discover_current_worker_registration()
+    assert logical_board_snapshot(fixture.conn) == before
+
+
+@darwin_only
+def test_registration_discovery_rejects_stale_leader_with_zero_delta(
+    registered_current_process,
+):
+    fixture = registered_current_process
+    fence = json.loads(fixture.raw_fence)
+    stale_identity = f"darwin:{fence['leader_pid']}:0:0"
+    fence["worker_identity"] = stale_identity
+    raw_fence = json.dumps(fence, sort_keys=True, separators=(",", ":"))
+    fixture.conn.execute(
+        "UPDATE tasks SET worker_identity=?, worker_fence=? WHERE id=?",
+        (stale_identity, raw_fence, fixture.task_id),
+    )
+    fixture.conn.execute(
+        "UPDATE task_runs SET worker_identity=?, worker_fence=? WHERE id=?",
+        (stale_identity, raw_fence, fixture.claimed.current_run_id),
+    )
+    fixture.conn.commit()
+    before = logical_board_snapshot(fixture.conn)
+    with pytest.raises(kb.StaleAttemptError):
+        kb._discover_current_worker_registration()
+    assert logical_board_snapshot(fixture.conn) == before
+
+
+@darwin_only
+def test_missing_host_identity_cannot_match_unknown_fence(
+    registered_current_process,
+    monkeypatch,
+):
+    from hermes_cli import process_bootstrap
+
+    fixture = registered_current_process
+    fence = json.loads(fixture.raw_fence)
+    fence["host"] = "unknown"
+    raw_fence = json.dumps(fence, sort_keys=True, separators=(",", ":"))
+    fixture.conn.execute(
+        "UPDATE tasks SET worker_fence=? WHERE id=?",
+        (raw_fence, fixture.task_id),
+    )
+    fixture.conn.execute(
+        "UPDATE task_runs SET worker_fence=? WHERE id=?",
+        (raw_fence, fixture.claimed.current_run_id),
+    )
+    fixture.conn.commit()
+    before = logical_board_snapshot(fixture.conn)
+
+    def fail_hostname():
+        raise OSError("hostname unavailable")
+
+    monkeypatch.setattr(process_bootstrap.socket, "gethostname", fail_hostname)
+    with pytest.raises(kb.StaleAttemptError):
+        kb._discover_current_worker_registration()
+    assert logical_board_snapshot(fixture.conn) == before
+
+
+@darwin_only
+def test_registration_discovery_rejects_foreign_host_with_zero_delta(
+    registered_current_process,
+):
+    fixture = registered_current_process
+    fence = json.loads(fixture.raw_fence)
+    fence["host"] = "foreign-host"
+    raw_fence = json.dumps(fence, sort_keys=True, separators=(",", ":"))
+    fixture.conn.execute(
+        "UPDATE tasks SET worker_fence=? WHERE id=?",
+        (raw_fence, fixture.task_id),
+    )
+    fixture.conn.execute(
+        "UPDATE task_runs SET worker_fence=? WHERE id=?",
+        (raw_fence, fixture.claimed.current_run_id),
+    )
+    fixture.conn.commit()
+    before = logical_board_snapshot(fixture.conn)
+    with pytest.raises(kb.StaleAttemptError):
+        kb._discover_current_worker_registration()
+    assert logical_board_snapshot(fixture.conn) == before
+
+
+@darwin_only
+def test_registration_discovery_rejects_cross_task_run_with_zero_delta(
+    registered_current_process,
+):
+    fixture = registered_current_process
+    identity = kb._darwin_process_identity(os.getpgid(0))
+    assert identity is not None
+    other_task_id, other_claimed, other_fence = create_bound_attempt(
+        fixture.conn,
+        leader_identity=identity,
+    )
+    fixture.conn.execute(
+        "UPDATE tasks SET current_run_id=?, claim_lock=?, worker_pid=?, "
+        "worker_pgid=?, worker_identity=?, worker_fence=? WHERE id=?",
+        (
+            other_claimed.current_run_id,
+            other_claimed.claim_lock,
+            identity.pid,
+            identity.pgid,
+            identity.token,
+            other_fence,
+            fixture.task_id,
+        ),
+    )
+    fixture.conn.execute(
+        "UPDATE tasks SET worker_pgid=NULL, worker_fence=NULL WHERE id=?",
+        (other_task_id,),
+    )
+    fixture.conn.commit()
+    before = logical_board_snapshot(fixture.conn)
+    with pytest.raises(kb.StaleAttemptError):
+        kb._discover_current_worker_registration()
+    assert logical_board_snapshot(fixture.conn) == before
 
 
 @darwin_only
@@ -154,3 +321,61 @@ def test_registration_discovery_ignores_board_symlink_outside_root(
     link.parent.mkdir(parents=True, exist_ok=True)
     link.symlink_to(outside, target_is_directory=True)
     assert kb._discover_current_worker_registration() is None
+
+
+def test_board_inventory_fails_closed_when_board_root_stat_is_unreadable(
+    isolated_home,
+    monkeypatch,
+):
+    from hermes_cli import process_bootstrap
+
+    target = kb.boards_root()
+    real_stat = Path.stat
+
+    def guarded_stat(path, *args, **kwargs):
+        if path == target:
+            raise OSError("board root unreadable")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", guarded_stat)
+    with pytest.raises(kb.StaleAttemptError):
+        process_bootstrap._canonical_board_db_paths()
+
+
+def test_board_inventory_fails_closed_when_board_db_stat_is_unreadable(
+    isolated_home,
+    monkeypatch,
+):
+    from hermes_cli import process_bootstrap
+
+    target = kb.kanban_home() / "kanban.db"
+    real_stat = Path.stat
+
+    def guarded_stat(path, *args, **kwargs):
+        if path == target:
+            raise OSError("board DB unreadable")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", guarded_stat)
+    with pytest.raises(kb.StaleAttemptError):
+        process_bootstrap._canonical_board_db_paths()
+
+
+def test_board_inventory_fails_closed_when_directory_listing_fails(
+    isolated_home,
+    monkeypatch,
+):
+    from hermes_cli import process_bootstrap
+
+    root = kb.boards_root()
+    root.mkdir(parents=True, exist_ok=True)
+    real_iterdir = Path.iterdir
+
+    def guarded_iterdir(path):
+        if path == root:
+            raise OSError("board listing unreadable")
+        return real_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
+    with pytest.raises(kb.StaleAttemptError):
+        process_bootstrap._canonical_board_db_paths()
