@@ -257,6 +257,130 @@ def test_registration_discovery_rejects_foreign_host_with_zero_delta(
     assert logical_board_snapshot(fixture.conn) == before
 
 
+@pytest.mark.parametrize(
+    ("field", "malformed"),
+    [
+        pytest.param("run_id", True, id="run-id-bool"),
+        pytest.param("run_id", 0, id="run-id-zero"),
+        pytest.param("claim_lock", "", id="claim-lock-empty"),
+        pytest.param("host", "", id="host-empty"),
+        pytest.param("leader_pid", True, id="leader-pid-bool"),
+        pytest.param("leader_pid", 0, id="leader-pid-zero"),
+        pytest.param("worker_pgid", True, id="worker-pgid-bool"),
+        pytest.param("worker_pgid", -1, id="worker-pgid-negative"),
+        pytest.param("worker_identity", "", id="worker-identity-empty"),
+        pytest.param("reason", "", id="reason-empty"),
+        pytest.param("created_at", True, id="created-at-bool"),
+        pytest.param("created_at", "1", id="created-at-string"),
+    ],
+)
+@darwin_only
+def test_provenance_rejects_malformed_fence_fields_with_zero_delta(
+    registered_current_process,
+    field,
+    malformed,
+):
+    from hermes_cli import process_bootstrap
+
+    fixture = registered_current_process
+    caller_identity = kb._darwin_process_identity(os.getpid())
+    assert caller_identity is not None
+    row = dict(
+        process_bootstrap._read_registration_rows(
+            fixture.board_path,
+            os.getpgid(0),
+        )[0]
+    )
+    fence = json.loads(row["task_worker_fence"])
+    fence[field] = malformed
+    raw_fence = json.dumps(fence, sort_keys=True, separators=(",", ":"))
+    row["task_worker_fence"] = raw_fence
+    row["run_worker_fence"] = raw_fence
+    before = logical_board_snapshot(fixture.conn)
+    with pytest.raises(kb.StaleAttemptError):
+        process_bootstrap._validated_provenance(
+            fixture.board_path,
+            row,
+            caller_identity,
+        )
+    assert logical_board_snapshot(fixture.conn) == before
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "run-id-bool",
+        "run-id-string",
+        "claim-lock-int",
+        "leader-pid-string",
+        "leader-pid-invalid-string",
+        "worker-pgid-string",
+        "worker-identity-bytes",
+        "task-id-bytes",
+    ],
+)
+@darwin_only
+def test_provenance_rejects_malformed_row_fields_with_zero_delta(
+    registered_current_process,
+    case,
+):
+    from hermes_cli import process_bootstrap
+
+    fixture = registered_current_process
+    caller_identity = kb._darwin_process_identity(os.getpid())
+    assert caller_identity is not None
+    row = dict(
+        process_bootstrap._read_registration_rows(
+            fixture.board_path,
+            os.getpgid(0),
+        )[0]
+    )
+    fence = json.loads(row["task_worker_fence"])
+    if case == "run-id-bool":
+        malformed = True
+        row.update(task_run_id=malformed, run_id=malformed)
+        fence["run_id"] = malformed
+    elif case == "run-id-string":
+        malformed = str(row["task_run_id"])
+        row.update(task_run_id=malformed, run_id=malformed)
+        fence["run_id"] = malformed
+    elif case == "claim-lock-int":
+        malformed = 7
+        row.update(task_claim_lock=malformed, run_claim_lock=malformed)
+        fence["claim_lock"] = malformed
+    elif case in {"leader-pid-string", "leader-pid-invalid-string"}:
+        malformed = (
+            str(row["task_worker_pid"]) if case == "leader-pid-string" else "not-an-int"
+        )
+        row.update(task_worker_pid=malformed, run_worker_pid=malformed)
+        fence["leader_pid"] = malformed
+    elif case == "worker-pgid-string":
+        malformed = str(row["task_worker_pgid"])
+        row.update(task_worker_pgid=malformed, run_worker_pgid=malformed)
+        fence["worker_pgid"] = malformed
+    elif case == "worker-identity-bytes":
+        malformed = row["task_worker_identity"].encode()
+        row.update(
+            task_worker_identity=malformed,
+            run_worker_identity=malformed,
+        )
+        fence["worker_identity"] = "not-the-row-bytes"
+    else:
+        malformed = row["task_id"].encode()
+        row.update(task_id=malformed, run_task_id=malformed)
+    raw_fence = json.dumps(fence, sort_keys=True, separators=(",", ":"))
+    row["task_worker_fence"] = raw_fence
+    row["run_worker_fence"] = raw_fence
+    before = logical_board_snapshot(fixture.conn)
+    with pytest.raises(kb.StaleAttemptError):
+        process_bootstrap._validated_provenance(
+            fixture.board_path,
+            row,
+            caller_identity,
+        )
+    assert logical_board_snapshot(fixture.conn) == before
+
+
 @darwin_only
 def test_registration_discovery_rejects_cross_task_run_with_zero_delta(
     registered_current_process,

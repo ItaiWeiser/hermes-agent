@@ -236,6 +236,14 @@ def _read_registration_rows(path: Path, caller_pgid: int) -> list[sqlite3.Row]:
         conn.close()
 
 
+def _is_positive_int(value: object) -> bool:
+    return type(value) is int and value > 0
+
+
+def _is_non_empty_str(value: object) -> bool:
+    return type(value) is str and bool(value)
+
+
 def _validated_provenance(
     path: Path,
     row: sqlite3.Row,
@@ -251,34 +259,98 @@ def _validated_provenance(
         "reason",
         "created_at",
     }
-    raw_fence = row["task_worker_fence"]
+    required_row_keys = {
+        "task_id",
+        "task_status",
+        "task_run_id",
+        "task_claim_lock",
+        "task_worker_pid",
+        "task_worker_pgid",
+        "task_worker_identity",
+        "task_worker_fence",
+        "run_id",
+        "run_task_id",
+        "run_status",
+        "run_claim_lock",
+        "run_worker_pid",
+        "run_worker_pgid",
+        "run_worker_identity",
+        "run_worker_fence",
+    }
+    try:
+        values = {key: row[key] for key in required_row_keys}
+    except (IndexError, KeyError, TypeError) as exc:
+        raise StaleAttemptError("worker registration row has an invalid shape") from exc
+
+    task_id = values["task_id"]
+    task_status = values["task_status"]
+    task_run_id = values["task_run_id"]
+    task_claim_lock = values["task_claim_lock"]
+    task_worker_pid = values["task_worker_pid"]
+    task_worker_pgid = values["task_worker_pgid"]
+    task_worker_identity = values["task_worker_identity"]
+    raw_fence = values["task_worker_fence"]
+    run_id = values["run_id"]
+    run_task_id = values["run_task_id"]
+    run_status = values["run_status"]
+    run_claim_lock = values["run_claim_lock"]
+    run_worker_pid = values["run_worker_pid"]
+    run_worker_pgid = values["run_worker_pgid"]
+    run_worker_identity = values["run_worker_identity"]
+    run_worker_fence = values["run_worker_fence"]
+    row_is_valid = (
+        _is_non_empty_str(task_id)
+        and _is_non_empty_str(run_task_id)
+        and _is_non_empty_str(task_status)
+        and _is_non_empty_str(run_status)
+        and _is_positive_int(task_run_id)
+        and _is_positive_int(run_id)
+        and _is_non_empty_str(task_claim_lock)
+        and _is_non_empty_str(run_claim_lock)
+        and _is_positive_int(task_worker_pid)
+        and _is_positive_int(run_worker_pid)
+        and _is_positive_int(task_worker_pgid)
+        and _is_positive_int(run_worker_pgid)
+        and _is_non_empty_str(task_worker_identity)
+        and _is_non_empty_str(run_worker_identity)
+        and _is_non_empty_str(raw_fence)
+        and _is_non_empty_str(run_worker_fence)
+    )
+    if not row_is_valid:
+        raise StaleAttemptError("worker registration row has invalid field types")
+
     try:
         fence = json.loads(raw_fence)
     except (TypeError, json.JSONDecodeError) as exc:
         raise StaleAttemptError("worker fence is not valid JSON") from exc
-    if not isinstance(fence, dict) or set(fence) != required_fence_keys:
+    if type(fence) is not dict or set(fence) != required_fence_keys:
         raise StaleAttemptError("worker fence has an invalid shape")
+    fence_is_valid = (
+        _is_positive_int(fence["run_id"])
+        and _is_non_empty_str(fence["claim_lock"])
+        and _is_non_empty_str(fence["host"])
+        and _is_positive_int(fence["leader_pid"])
+        and _is_positive_int(fence["worker_pgid"])
+        and _is_non_empty_str(fence["worker_identity"])
+        and _is_non_empty_str(fence["reason"])
+        and _is_positive_int(fence["created_at"])
+    )
+    if not fence_is_valid:
+        raise StaleAttemptError("worker fence has invalid field types")
     canonical = json.dumps(fence, sort_keys=True, separators=(",", ":"))
     if canonical != raw_fence:
         raise StaleAttemptError("worker fence is not canonical JSON")
 
-    task_run_id = row["task_run_id"]
-    task_claim_lock = row["task_claim_lock"]
-    task_worker_pid = row["task_worker_pid"]
-    task_worker_pgid = row["task_worker_pgid"]
-    task_worker_identity = row["task_worker_identity"]
     copies_match = (
-        task_run_id is not None
-        and task_run_id == row["run_id"]
-        and row["run_task_id"] == row["task_id"]
-        and task_claim_lock
-        and task_claim_lock == row["run_claim_lock"]
-        and task_worker_pid == row["run_worker_pid"]
-        and task_worker_pgid == row["run_worker_pgid"]
-        and task_worker_identity == row["run_worker_identity"]
-        and raw_fence == row["run_worker_fence"]
-        and row["task_status"] == "running"
-        and row["run_status"] == "running"
+        task_run_id == run_id
+        and run_task_id == task_id
+        and task_claim_lock == run_claim_lock
+        and task_worker_pid == run_worker_pid
+        and task_worker_pgid == run_worker_pgid
+        and task_worker_identity == run_worker_identity
+        and raw_fence == run_worker_fence
+        and task_status == "running"
+        and run_status == "running"
     )
     if not copies_match:
         raise StaleAttemptError("task and run worker registrations differ")
@@ -292,13 +364,10 @@ def _validated_provenance(
         and fence["leader_pid"] == task_worker_pid
         and fence["worker_pgid"] == task_worker_pgid
         and fence["worker_identity"] == task_worker_identity
-        and isinstance(fence["reason"], str)
-        and bool(fence["reason"])
-        and isinstance(fence["created_at"], int)
     )
     if not fence_matches:
         raise StaleAttemptError("worker fence does not match the active run")
-    leader_identity = _darwin_process_identity(int(task_worker_pid))
+    leader_identity = _darwin_process_identity(task_worker_pid)
     if (
         leader_identity is None
         or leader_identity.pgid != task_worker_pgid
@@ -311,10 +380,10 @@ def _validated_provenance(
         caller_identity=caller_identity,
         leader_identity=leader_identity,
         board_db_path=str(path),
-        task_id=row["task_id"],
-        run_id=int(task_run_id),
-        claim_lock=str(task_claim_lock),
-        raw_fence=str(raw_fence),
+        task_id=task_id,
+        run_id=task_run_id,
+        claim_lock=task_claim_lock,
+        raw_fence=raw_fence,
     )
 
 

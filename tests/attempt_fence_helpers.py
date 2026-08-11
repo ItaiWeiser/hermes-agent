@@ -43,8 +43,8 @@ def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "attempt-fence")
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
-    with kb.connect() as conn:
-        pass
+    conn = kb.connect()
+    conn.close()
     return home
 
 
@@ -103,10 +103,14 @@ def registered_current_process(isolated_home):
         conn,
         leader_identity=identity,
     )
-    return SimpleNamespace(
+    fixture = SimpleNamespace(
         conn=conn,
         task_id=task_id,
         claimed=claimed,
         raw_fence=raw_fence,
         board_path=Path(conn.execute("PRAGMA database_list").fetchone()["file"]),
     )
+    try:
+        yield fixture
+    finally:
+        conn.close()
