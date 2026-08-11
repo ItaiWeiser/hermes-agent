@@ -130,6 +130,34 @@ def test_claim_with_fence_precedes_dependency_demote_and_run_cleanup(
     assert logical_board_snapshot(fixture.conn) == before
 
 
+@pytest.mark.parametrize("non_ready_status", ["todo", "blocked", "review", "done"])
+@darwin_only
+def test_claim_task_rejects_any_fenced_non_ready_status_with_zero_delta(
+    registered_current_process,
+    non_ready_status,
+):
+    fixture = registered_current_process
+    parent_id = kb.create_task(fixture.conn, title="unfinished parent")
+    fixture.conn.execute(
+        "UPDATE tasks SET status='todo' WHERE id=?",
+        (parent_id,),
+    )
+    kb.link_tasks(fixture.conn, parent_id, fixture.task_id)
+    fixture.conn.execute(
+        "UPDATE tasks SET status=? WHERE id=?",
+        (non_ready_status, fixture.task_id),
+    )
+    fixture.conn.commit()
+    before = logical_board_snapshot(fixture.conn)
+
+    assert kb.claim_task(
+        fixture.conn,
+        fixture.task_id,
+        claimer="second:claim",
+    ) is None
+    assert logical_board_snapshot(fixture.conn) == before
+
+
 @darwin_only
 def test_claim_review_task_rejects_fenced_retry_state_with_zero_delta(
     registered_current_process,
@@ -219,6 +247,57 @@ def test_terminal_transition_preserves_fenced_process_tuple(
     with pytest.raises(kb.StaleAttemptError):
         kb.add_comment(fixture.conn, fixture.task_id, "dor-coo", "late")
     assert logical_board_snapshot(fixture.conn) == before_late_call
+
+
+@darwin_only
+def test_dependency_block_and_promotion_stay_hidden_until_exact_reap(
+    registered_current_process,
+    monkeypatch,
+):
+    fixture = registered_current_process
+    run_id = fixture.claimed.current_run_id
+    parent_id = kb.create_task(fixture.conn, title="dependency")
+    fixture.conn.execute(
+        "UPDATE tasks SET status='todo' WHERE id=?",
+        (parent_id,),
+    )
+    kb.link_tasks(fixture.conn, parent_id, fixture.task_id)
+    before_tuple = process_tuple(kb.get_task(fixture.conn, fixture.task_id))
+
+    assert kb.block_task(
+        fixture.conn,
+        fixture.task_id,
+        reason="waiting for dependency",
+        kind="dependency",
+        expected_run_id=run_id,
+    )
+    task = kb.get_task(fixture.conn, fixture.task_id)
+    run = fixture.conn.execute(
+        "SELECT outcome, metadata FROM task_runs WHERE id=?",
+        (run_id,),
+    ).fetchone()
+    assert task.status == "running"
+    assert process_tuple(task) == before_tuple
+    assert run["outcome"] == "blocked"
+    assert json.loads(run["metadata"])["retry_status"] == "todo"
+    assert kb.reap_terminal_attempt_fences(fixture.conn) == []
+
+    fixture.conn.execute(
+        "UPDATE tasks SET status='done' WHERE id=?",
+        (parent_id,),
+    )
+    fixture.conn.commit()
+    before_promotion = logical_board_snapshot(fixture.conn)
+    assert kb.recompute_ready(fixture.conn) == 0
+    assert logical_board_snapshot(fixture.conn) == before_promotion
+
+    monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: "dead")
+    assert kb.reap_terminal_attempt_fences(fixture.conn) == [
+        ("task", fixture.task_id)
+    ]
+    assert kb.get_task(fixture.conn, fixture.task_id).status == "todo"
+    assert kb.recompute_ready(fixture.conn) == 1
+    assert kb.get_task(fixture.conn, fixture.task_id).status == "ready"
 
 
 @pytest.mark.parametrize(
@@ -456,6 +535,100 @@ def test_reaper_honors_requested_bound(registered_current_process, monkeypatch):
         "SELECT COUNT(*) FROM tasks WHERE worker_fence IS NOT NULL"
     ).fetchone()[0]
     assert remaining == 1
+
+
+@darwin_only
+def test_reaper_cursor_prevents_live_prefix_starvation_and_reaches_orphan(
+    registered_current_process,
+    monkeypatch,
+):
+    fixture = registered_current_process
+    identity = kb._darwin_process_identity(os.getpgid(0))
+    assert identity is not None
+    attempts = [
+        (fixture.task_id, fixture.claimed, fixture.raw_fence),
+        create_bound_attempt(fixture.conn, leader_identity=identity),
+        create_bound_attempt(fixture.conn, leader_identity=identity),
+    ]
+    attempts.sort(key=lambda item: item[0])
+
+    def set_reason(task_id, claimed, raw, reason):
+        fence = json.loads(raw)
+        fence["reason"] = reason
+        updated = json.dumps(fence, sort_keys=True, separators=(",", ":"))
+        fixture.conn.execute(
+            "UPDATE tasks SET status='blocked', worker_fence=? WHERE id=?",
+            (updated, task_id),
+        )
+        fixture.conn.execute(
+            "UPDATE task_runs SET worker_fence=? WHERE id=?",
+            (updated, claimed.current_run_id),
+        )
+        return updated
+
+    alive_id, alive_claimed, alive_raw = attempts[0]
+    unknown_id, unknown_claimed, unknown_raw = attempts[1]
+    dead_id, dead_claimed, dead_raw = attempts[2]
+    alive_raw = set_reason(alive_id, alive_claimed, alive_raw, "fair_alive")
+    unknown_raw = set_reason(
+        unknown_id,
+        unknown_claimed,
+        unknown_raw,
+        "fair_unknown",
+    )
+    set_reason(dead_id, dead_claimed, dead_raw, "fair_dead")
+
+    orphan_task_id, orphan_claimed, orphan_raw = create_bound_attempt(
+        fixture.conn,
+        leader_identity=identity,
+    )
+    orphan_fence = json.loads(orphan_raw)
+    orphan_fence["reason"] = "spawn_bind_failed"
+    orphan_raw = json.dumps(
+        orphan_fence,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    fixture.conn.execute(
+        "UPDATE task_runs SET worker_fence=? WHERE id=?",
+        (orphan_raw, orphan_claimed.current_run_id),
+    )
+    fixture.conn.execute(
+        "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+        "claim_expires=NULL, worker_pid=NULL, worker_pgid=NULL, "
+        "worker_identity=NULL, worker_fence=NULL WHERE id=?",
+        (orphan_task_id,),
+    )
+    fixture.conn.commit()
+    newer = kb.claim_task(fixture.conn, orphan_task_id, claimer="new:owner")
+    assert newer is not None
+    newer_tuple = process_tuple(newer)
+
+    def state_for_reason(fence):
+        return {
+            "fair_alive": "alive",
+            "fair_unknown": "unknown",
+            "fair_dead": "dead",
+            "spawn_bind_failed": "dead",
+        }[fence["reason"]]
+
+    monkeypatch.setattr(kb, "_fenced_group_state", state_for_reason)
+    observed = []
+    for _ in range(4):
+        batch = kb.reap_terminal_attempt_fences(fixture.conn, limit=2)
+        assert len(batch) <= 2
+        observed.extend(batch)
+
+    assert ("task", dead_id) in observed
+    assert ("run", orphan_claimed.current_run_id) in observed
+    assert kb.get_task(fixture.conn, alive_id).worker_fence == alive_raw
+    assert kb.get_task(fixture.conn, unknown_id).worker_fence == unknown_raw
+    assert kb.get_task(fixture.conn, dead_id).worker_fence is None
+    assert _run_process_tuple(
+        fixture.conn,
+        orphan_claimed.current_run_id,
+    ) == (None, None, None, None, None, None)
+    assert process_tuple(kb.get_task(fixture.conn, orphan_task_id)) == newer_tuple
 
 
 def test_dispatch_tick_calls_reaper_once_and_dry_run_never_calls_it(

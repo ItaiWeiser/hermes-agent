@@ -119,6 +119,7 @@ def _identity_matches(expected: DarwinProcessIdentity) -> bool:
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 TERMINAL_FENCE_REAP_LIMIT = 16
+_TERMINAL_FENCE_REAP_CURSORS: dict[str, str] = {}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -4530,7 +4531,7 @@ def _decoded_fence(raw_fence: Any) -> Optional[dict[str, Any]]:
 
 
 def _recorded_retry_status(run: Mapping[str, Any]) -> Optional[str]:
-    if run["outcome"] in {"completed", "blocked", "gave_up"}:
+    if run["outcome"] in {"completed", "gave_up"}:
         return None
     try:
         metadata = json.loads(run["metadata"]) if run["metadata"] else {}
@@ -4538,6 +4539,64 @@ def _recorded_retry_status(run: Mapping[str, Any]) -> Optional[str]:
         return None
     retry_status = metadata.get("retry_status") if isinstance(metadata, dict) else None
     return retry_status if retry_status in {"todo", "ready", "review"} else None
+
+
+def _terminal_fence_reap_cursor_key(conn: sqlite3.Connection) -> str:
+    """Return a process-local cursor key for this board database."""
+    for row in conn.execute("PRAGMA database_list").fetchall():
+        if row["name"] == "main" and row["file"]:
+            return str(row["file"])
+    return f"connection:{id(conn)}"
+
+
+_TERMINAL_FENCE_CANDIDATES_SQL = """
+    SELECT * FROM (
+        SELECT 'task' AS owner_kind, t.id AS owner_id, t.id AS task_id,
+               r.id AS run_id, t.worker_pid, t.worker_pgid,
+               t.worker_identity, t.worker_fence, r.outcome, r.metadata,
+               '0:task:' || t.id AS sort_key
+          FROM tasks t
+          JOIN task_runs r ON r.id = t.current_run_id
+         WHERE t.worker_fence IS NOT NULL
+           AND (t.status <> 'running' OR r.ended_at IS NOT NULL)
+        UNION ALL
+        SELECT 'run' AS owner_kind, r.id AS owner_id, r.task_id,
+               r.id AS run_id, r.worker_pid, r.worker_pgid,
+               r.worker_identity, r.worker_fence, r.outcome, r.metadata,
+               '1:run:' || printf('%020d', r.id) AS sort_key
+          FROM task_runs r
+          LEFT JOIN tasks t ON t.id = r.task_id
+         WHERE r.worker_fence IS NOT NULL
+           AND (t.current_run_id IS NULL OR t.current_run_id <> r.id)
+           AND CASE WHEN json_valid(r.worker_fence)
+                    THEN json_extract(r.worker_fence, '$.reason')
+                    ELSE NULL END = 'spawn_bind_failed'
+    )
+"""
+
+
+def _terminal_fence_candidates(
+    conn: sqlite3.Connection,
+    *,
+    cursor: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Read one bounded, wrapping batch after ``cursor``."""
+    rows = conn.execute(
+        _TERMINAL_FENCE_CANDIDATES_SQL
+        + " WHERE sort_key > ? ORDER BY sort_key LIMIT ?",
+        (cursor, limit),
+    ).fetchall()
+    candidates = [dict(row) for row in rows]
+    remaining = limit - len(candidates)
+    if remaining and cursor:
+        wrapped = conn.execute(
+            _TERMINAL_FENCE_CANDIDATES_SQL
+            + " WHERE sort_key <= ? ORDER BY sort_key LIMIT ?",
+            (cursor, remaining),
+        ).fetchall()
+        candidates.extend(dict(row) for row in wrapped)
+    return candidates
 
 
 def reap_terminal_attempt_fences(
@@ -4550,43 +4609,17 @@ def reap_terminal_attempt_fences(
     if bounded_limit == 0:
         return []
 
-    candidates: list[dict[str, Any]] = []
-    task_rows = conn.execute(
-        """
-        SELECT 'task' AS owner_kind, t.id AS owner_id, t.id AS task_id,
-               r.id AS run_id, t.worker_pid, t.worker_pgid,
-               t.worker_identity, t.worker_fence, r.outcome, r.metadata
-          FROM tasks t
-          JOIN task_runs r ON r.id = t.current_run_id
-         WHERE t.worker_fence IS NOT NULL
-           AND (t.status <> 'running' OR r.ended_at IS NOT NULL)
-         ORDER BY t.id
-         LIMIT ?
-        """,
-        (bounded_limit,),
-    ).fetchall()
-    candidates.extend(dict(row) for row in task_rows)
-
-    remaining = bounded_limit - len(candidates)
-    if remaining:
-        orphan_rows = conn.execute(
-            """
-            SELECT 'run' AS owner_kind, r.id AS owner_id, r.task_id,
-                   r.id AS run_id, r.worker_pid, r.worker_pgid,
-                   r.worker_identity, r.worker_fence, r.outcome, r.metadata
-              FROM task_runs r
-              LEFT JOIN tasks t ON t.id = r.task_id
-             WHERE r.worker_fence IS NOT NULL
-               AND (t.current_run_id IS NULL OR t.current_run_id <> r.id)
-               AND CASE WHEN json_valid(r.worker_fence)
-                        THEN json_extract(r.worker_fence, '$.reason')
-                        ELSE NULL END = 'spawn_bind_failed'
-             ORDER BY r.id
-             LIMIT ?
-            """,
-            (remaining,),
-        ).fetchall()
-        candidates.extend(dict(row) for row in orphan_rows)
+    cursor_key = _terminal_fence_reap_cursor_key(conn)
+    cursor = _TERMINAL_FENCE_REAP_CURSORS.get(cursor_key, "")
+    candidates = _terminal_fence_candidates(
+        conn,
+        cursor=cursor,
+        limit=bounded_limit,
+    )
+    if not candidates:
+        _TERMINAL_FENCE_REAP_CURSORS.pop(cursor_key, None)
+        return []
+    _TERMINAL_FENCE_REAP_CURSORS[cursor_key] = candidates[-1]["sort_key"]
 
     reaped: list[tuple[Literal["task", "run"], str | int]] = []
     for candidate in candidates:
@@ -4830,7 +4863,8 @@ def recompute_ready(
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked') "
+            "AND worker_fence IS NULL"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -4866,16 +4900,21 @@ def recompute_ready(
                     )
                     if failures >= effective_limit:
                         continue
-                    conn.execute(
+                    updated = conn.execute(
                         "UPDATE tasks SET status = ? "
-                        "WHERE id = ? AND status = 'blocked'",
+                        "WHERE id = ? AND status = 'blocked' "
+                        "AND worker_fence IS NULL",
                         (resume_status, task_id),
                     )
                 else:
-                    conn.execute(
-                        "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
+                    updated = conn.execute(
+                        "UPDATE tasks SET status = ? "
+                        "WHERE id = ? AND status = 'todo' "
+                        "AND worker_fence IS NULL",
                         (resume_status, task_id),
                     )
+                if updated.rowcount != 1:
+                    continue
                 _append_event(
                     conn, task_id, "promoted",
                     {"status": resume_status} if resume_status != "ready" else None,
@@ -4916,7 +4955,7 @@ def claim_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
         fenced = conn.execute(
-            "SELECT worker_fence FROM tasks WHERE id = ? AND status = 'ready'",
+            "SELECT worker_fence FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if fenced is not None and fenced["worker_fence"] is not None:
@@ -6745,7 +6784,8 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, worker_fence "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
@@ -6771,7 +6811,8 @@ def block_task(
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status        = 'todo',
+                   SET status        = CASE WHEN worker_fence IS NULL
+                                            THEN 'todo' ELSE status END,
                        claim_lock    = CASE WHEN worker_fence IS NULL
                                             THEN NULL ELSE claim_lock END,
                        claim_expires = CASE WHEN worker_fence IS NULL
@@ -6791,6 +6832,11 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=(
+                    {"retry_status": "todo"}
+                    if cur_row["worker_fence"] is not None
+                    else None
+                ),
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
