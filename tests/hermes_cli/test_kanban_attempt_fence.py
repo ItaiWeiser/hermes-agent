@@ -5,6 +5,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -537,10 +538,30 @@ def test_reaper_honors_requested_bound(registered_current_process, monkeypatch):
     assert remaining == 1
 
 
+def test_init_db_migrates_durable_terminal_reaper_cursor(isolated_home):
+    conn = kb.connect()
+    db_path = Path(
+        conn.execute("PRAGMA database_list").fetchone()["file"]
+    )
+    conn.execute("DROP TABLE IF EXISTS terminal_fence_reap_state")
+    conn.commit()
+    conn.close()
+
+    kb.init_db(db_path)
+
+    with kb.connect_closing(db_path) as reopened:
+        columns = reopened.execute(
+            "PRAGMA table_info(terminal_fence_reap_state)"
+        ).fetchall()
+    assert [(row["name"], row["type"], row["pk"]) for row in columns] == [
+        ("singleton", "INTEGER", 1),
+        ("cursor", "TEXT", 0),
+    ]
+
+
 @darwin_only
-def test_reaper_cursor_prevents_live_prefix_starvation_and_reaches_orphan(
+def test_reaper_durable_cursor_survives_one_shot_restart_and_reaches_orphan(
     registered_current_process,
-    monkeypatch,
 ):
     fixture = registered_current_process
     identity = kb._darwin_process_identity(os.getpgid(0))
@@ -604,20 +625,36 @@ def test_reaper_cursor_prevents_live_prefix_starvation_and_reaches_orphan(
     assert newer is not None
     newer_tuple = process_tuple(newer)
 
-    def state_for_reason(fence):
-        return {
-            "fair_alive": "alive",
-            "fair_unknown": "unknown",
-            "fair_dead": "dead",
-            "spawn_bind_failed": "dead",
-        }[fence["reason"]]
+    one_shot = """
+import json
+import sys
+from pathlib import Path
+from hermes_cli import kanban_db as kb
 
-    monkeypatch.setattr(kb, "_fenced_group_state", state_for_reason)
+states = {
+    "fair_alive": "alive",
+    "fair_unknown": "unknown",
+    "fair_dead": "dead",
+    "spawn_bind_failed": "dead",
+}
+kb._fenced_group_state = lambda fence: states[fence["reason"]]
+with kb.connect_closing(Path(sys.argv[1])) as conn:
+    print(json.dumps(kb.reap_terminal_attempt_fences(conn, limit=2)))
+"""
     observed = []
     for _ in range(4):
-        batch = kb.reap_terminal_attempt_fences(fixture.conn, limit=2)
+        # Official ``hermes kanban dispatch`` can run as a fresh one-shot
+        # process on every tick.  A real child interpreter proves the cursor
+        # survives both module state loss and a newly-opened DB connection.
+        completed = subprocess.run(
+            [sys.executable, "-c", one_shot, str(fixture.board_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        batch = json.loads(completed.stdout.strip().splitlines()[-1])
         assert len(batch) <= 2
-        observed.extend(batch)
+        observed.extend(tuple(item) for item in batch)
 
     assert ("task", dead_id) in observed
     assert ("run", orphan_claimed.current_run_id) in observed
@@ -629,6 +666,108 @@ def test_reaper_cursor_prevents_live_prefix_starvation_and_reaches_orphan(
         orphan_claimed.current_run_id,
     ) == (None, None, None, None, None, None)
     assert process_tuple(kb.get_task(fixture.conn, orphan_task_id)) == newer_tuple
+
+
+@darwin_only
+def test_reaper_cursor_reservation_serializes_independent_connections(
+    registered_current_process,
+    monkeypatch,
+):
+    fixture = registered_current_process
+    identity = kb._darwin_process_identity(os.getpgid(0))
+    assert identity is not None
+    attempts = [(fixture.task_id, fixture.claimed, fixture.raw_fence)]
+    attempts.extend(
+        create_bound_attempt(fixture.conn, leader_identity=identity)
+        for _ in range(3)
+    )
+    expected_reasons = set()
+    for index, (task_id, claimed, raw_fence) in enumerate(
+        sorted(attempts, key=lambda item: item[0])
+    ):
+        fence = json.loads(raw_fence)
+        fence["reason"] = f"concurrent_{index}"
+        expected_reasons.add(fence["reason"])
+        encoded = json.dumps(fence, sort_keys=True, separators=(",", ":"))
+        fixture.conn.execute(
+            "UPDATE tasks SET status='blocked', worker_fence=? WHERE id=?",
+            (encoded, task_id),
+        )
+        fixture.conn.execute(
+            "UPDATE task_runs SET worker_fence=? WHERE id=?",
+            (encoded, claimed.current_run_id),
+        )
+    fixture.conn.commit()
+
+    probed = []
+
+    def record_unknown(fence):
+        probed.append(fence["reason"])
+        return "unknown"
+
+    monkeypatch.setattr(kb, "_fenced_group_state", record_unknown)
+
+    def one_shot_reap():
+        with kb.connect_closing(fixture.board_path) as conn:
+            return kb.reap_terminal_attempt_fences(conn, limit=1)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: one_shot_reap(), range(2)))
+
+    assert results == [[], []]
+    assert len(probed) == 2
+    assert len(set(probed)) == 2
+    assert set(probed) <= expected_reasons
+
+
+@darwin_only
+def test_reaper_cursor_write_failure_rolls_back_before_probe_or_mutation(
+    registered_current_process,
+    monkeypatch,
+):
+    fixture = registered_current_process
+    identity = kb._darwin_process_identity(os.getpgid(0))
+    assert identity is not None
+    other_id, other_claimed, other_raw = create_bound_attempt(
+        fixture.conn,
+        leader_identity=identity,
+    )
+    fixture.conn.execute(
+        "UPDATE tasks SET status='blocked' WHERE id IN (?, ?)",
+        (fixture.task_id, other_id),
+    )
+    fixture.conn.commit()
+    monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: "unknown")
+
+    assert kb.reap_terminal_attempt_fences(fixture.conn, limit=1) == []
+    cursor_before = fixture.conn.execute(
+        "SELECT cursor FROM terminal_fence_reap_state WHERE singleton=1"
+    ).fetchone()["cursor"]
+    before = logical_board_snapshot(fixture.conn)
+    fixture.conn.execute(
+        """
+        CREATE TRIGGER reject_terminal_reap_cursor_update
+        BEFORE UPDATE ON terminal_fence_reap_state
+        BEGIN
+            SELECT RAISE(ABORT, 'cursor write rejected');
+        END
+        """
+    )
+    fixture.conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="cursor write rejected"):
+        kb.reap_terminal_attempt_fences(fixture.conn, limit=1)
+
+    cursor_after = fixture.conn.execute(
+        "SELECT cursor FROM terminal_fence_reap_state WHERE singleton=1"
+    ).fetchone()["cursor"]
+    assert cursor_after == cursor_before
+    assert logical_board_snapshot(fixture.conn) == before
+    assert kb.get_task(fixture.conn, other_id).worker_fence == other_raw
+    assert _run_process_tuple(
+        fixture.conn,
+        other_claimed.current_run_id,
+    )[-1] == other_raw
 
 
 def test_dispatch_tick_calls_reaper_once_and_dry_run_never_calls_it(

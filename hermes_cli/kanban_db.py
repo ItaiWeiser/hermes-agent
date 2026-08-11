@@ -119,7 +119,6 @@ def _identity_matches(expected: DarwinProcessIdentity) -> bool:
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 TERMINAL_FENCE_REAP_LIMIT = 16
-_TERMINAL_FENCE_REAP_CURSORS: dict[str, str] = {}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -1555,6 +1554,14 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
+);
+
+-- Durable board-local scheduling cursor for the bounded terminal-fence
+-- reaper.  This is not task authority: every cleanup still requires the
+-- raw fence/process tuple and exact CAS below.
+CREATE TABLE IF NOT EXISTS terminal_fence_reap_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    cursor    TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -4541,14 +4548,6 @@ def _recorded_retry_status(run: Mapping[str, Any]) -> Optional[str]:
     return retry_status if retry_status in {"todo", "ready", "review"} else None
 
 
-def _terminal_fence_reap_cursor_key(conn: sqlite3.Connection) -> str:
-    """Return a process-local cursor key for this board database."""
-    for row in conn.execute("PRAGMA database_list").fetchall():
-        if row["name"] == "main" and row["file"]:
-            return str(row["file"])
-    return f"connection:{id(conn)}"
-
-
 _TERMINAL_FENCE_CANDIDATES_SQL = """
     SELECT * FROM (
         SELECT 'task' AS owner_kind, t.id AS owner_id, t.id AS task_id,
@@ -4599,6 +4598,38 @@ def _terminal_fence_candidates(
     return candidates
 
 
+def _reserve_terminal_fence_candidates(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Atomically reserve one bounded batch and durably advance its cursor."""
+    with write_txn(conn):
+        state = conn.execute(
+            "SELECT cursor FROM terminal_fence_reap_state WHERE singleton=1"
+        ).fetchone()
+        cursor = state["cursor"] if state is not None else ""
+        candidates = _terminal_fence_candidates(
+            conn,
+            cursor=cursor,
+            limit=limit,
+        )
+        if candidates:
+            conn.execute(
+                """
+                INSERT INTO terminal_fence_reap_state(singleton, cursor)
+                VALUES (1, ?)
+                ON CONFLICT(singleton) DO UPDATE SET cursor=excluded.cursor
+                """,
+                (candidates[-1]["sort_key"],),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM terminal_fence_reap_state WHERE singleton=1"
+            )
+    return candidates
+
+
 def reap_terminal_attempt_fences(
     conn: sqlite3.Connection,
     *,
@@ -4609,17 +4640,12 @@ def reap_terminal_attempt_fences(
     if bounded_limit == 0:
         return []
 
-    cursor_key = _terminal_fence_reap_cursor_key(conn)
-    cursor = _TERMINAL_FENCE_REAP_CURSORS.get(cursor_key, "")
-    candidates = _terminal_fence_candidates(
+    candidates = _reserve_terminal_fence_candidates(
         conn,
-        cursor=cursor,
         limit=bounded_limit,
     )
     if not candidates:
-        _TERMINAL_FENCE_REAP_CURSORS.pop(cursor_key, None)
         return []
-    _TERMINAL_FENCE_REAP_CURSORS[cursor_key] = candidates[-1]["sort_key"]
 
     reaped: list[tuple[Literal["task", "run"], str | int]] = []
     for candidate in candidates:
