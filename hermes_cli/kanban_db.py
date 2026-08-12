@@ -96,10 +96,14 @@ from hermes_cli.process_bootstrap import (
     DarwinProcessIdentity,
     ProcessProvenance,
     StaleAttemptError,
+    MAX_CANONICAL_BOARD_DBS,
+    _canonical_board_db_paths,
     _darwin_process_identity,
     _discover_current_worker_registration,
     _host_id,
+    _read_registration_rows,
     _require_attempt_fence_platform,
+    _validated_provenance,
 )
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -151,6 +155,72 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+
+WORKER_CALLABLE_MUTATION_SURFACES = frozenset(
+    {
+        "create_task",
+        "assign_task",
+        "set_model_override",
+        "set_reasoning_effort",
+        "link_tasks",
+        "unlink_tasks",
+        "add_comment",
+        "store_attachment_bytes",
+        "add_attachment",
+        "delete_attachment",
+        "recompute_ready",
+        "heartbeat_claim",
+        "complete_task",
+        "edit_completed_task_result",
+        "block_task",
+        "request_review",
+        "request_changes",
+        "promote_task",
+        "unblock_task",
+        "reopen_review_task",
+        "invalidate_descendants_for_parent_reopen",
+        "specify_triage_task",
+        "decompose_triage_task",
+        "archive_task",
+        "delete_archived_task",
+        "delete_task",
+        "set_workspace_path",
+        "set_branch_name",
+        "schedule_task",
+        "heartbeat_worker",
+        "add_notify_sub",
+        "remove_notify_sub",
+        "claim_unseen_events_for_sub",
+        "advance_notify_cursor",
+        "rewind_notify_cursor",
+    }
+)
+
+REGISTERED_WORKER_DENIED_SURFACES = frozenset(
+    {
+        "set_current_board",
+        "clear_current_board",
+        "write_board_metadata",
+        "create_board",
+        "remove_board",
+        "repair_db",
+        "init_db",
+        "claim_task",
+        "claim_review_task",
+        "release_stale_claims",
+        "reap_terminal_attempt_fences",
+        "reclaim_task",
+        "reassign_task",
+        "enforce_max_runtime",
+        "detect_stale_running",
+        "reconcile_orphaned_running",
+        "detect_crashed_workers",
+        "dispatch_once",
+        "run_daemon",
+        "gc_events",
+        "gc_worker_logs",
+    }
+)
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -681,6 +751,7 @@ def set_current_board(slug: str) -> Path:
     so that ``hermes kanban boards switch <typo>`` returns an error
     instead of silently pointing at nothing.
     """
+    _deny_registered_worker_filesystem_control_plane()
     _assert_not_delegated_child_mutation()
     normed = _normalize_board_slug(slug)
     if not normed:
@@ -693,6 +764,7 @@ def set_current_board(slug: str) -> Path:
 
 def clear_current_board() -> None:
     """Remove ``<root>/kanban/current`` so the active board reverts to ``default``."""
+    _deny_registered_worker_filesystem_control_plane()
     _assert_not_delegated_child_mutation()
     try:
         current_board_path().unlink()
@@ -906,6 +978,7 @@ def write_board_metadata(
     project scope; a value sets it (not validated here — the caller resolves
     it against ``projects_db``).
     """
+    _deny_registered_worker_filesystem_control_plane()
     _assert_not_delegated_child_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta = read_board_metadata(slug)
@@ -954,6 +1027,7 @@ def create_board(
     malformed slug; returns the existing metadata (not an error) if the
     board already exists — matching ``mkdir -p`` semantics.
     """
+    _deny_registered_worker_filesystem_control_plane()
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
@@ -1026,6 +1100,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     Returns a summary dict describing what happened (``{"slug", "action",
     "new_path"}``).
     """
+    _deny_registered_worker_filesystem_control_plane()
     _assert_not_delegated_child_mutation()
     normed = _normalize_board_slug(slug)
     if not normed:
@@ -2292,6 +2367,7 @@ def repair_db(
     raw, exactly like the guard: a locked healthy DB is not corruption and
     must not be quarantined.
     """
+    _deny_registered_worker_filesystem_control_plane()
     if db_path is not None:
         path = db_path
     else:
@@ -2397,10 +2473,72 @@ def connect(
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
     """
+    prepared_provenance = _prepare_mutation_provenance()
     if db_path is not None:
         path = db_path
     else:
         path = kanban_db_path(board=board)
+
+    if prepared_provenance is not None:
+        try:
+            requested_identity = str(path.resolve(strict=True))
+            registered_identity = str(
+                Path(prepared_provenance.board_db_path).resolve(strict=True)
+            )
+        except OSError as exc:
+            raise RegisteredWorkerControlPlaneError(
+                "registered worker cannot create or initialize a kanban board"
+            ) from exc
+        if requested_identity != registered_identity:
+            raise CrossBoardWorkerMutationError(
+                "registered worker cannot open a different kanban board"
+            )
+        # A registered group may use only an already initialized own-board DB.
+        # Verify the Task-1 fence schema through a read-only handle before the
+        # normal writable connection is opened; never run schema/migrations.
+        uri = f"{Path(requested_identity).as_uri()}?mode=ro"
+        verification = sqlite3.connect(uri, uri=True)
+        try:
+            task_columns = {
+                row[1]
+                for row in verification.execute("PRAGMA table_info(tasks)")
+            }
+            run_columns = {
+                row[1]
+                for row in verification.execute("PRAGMA table_info(task_runs)")
+            }
+        finally:
+            verification.close()
+        required = {
+            "worker_pid",
+            "worker_pgid",
+            "worker_identity",
+            "worker_fence",
+        }
+        if not required.issubset(task_columns) or not required.issubset(run_columns):
+            raise AttemptFenceCapabilityError(
+                "registered worker board lacks the attempt-fence schema"
+            )
+        conn = _sqlite_connect(Path(requested_identity))
+        try:
+            conn.row_factory = sqlite3.Row
+            with _INIT_LOCK:
+                from hermes_state import apply_wal_with_fallback
+
+                apply_wal_with_fallback(
+                    conn,
+                    db_label=f"kanban.db ({Path(requested_identity).name})",
+                )
+                conn.execute("PRAGMA synchronous=FULL")
+                conn.execute("PRAGMA wal_autocheckpoint=100")
+                conn.execute("PRAGMA foreign_keys=ON")
+                conn.execute("PRAGMA secure_delete=ON")
+                conn.execute("PRAGMA cell_size_check=ON")
+        except Exception:
+            conn.close()
+            raise
+        return conn
+
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -2563,6 +2701,7 @@ def init_db(
     external tools that upgrade an old DB file — can call this to
     force re-migration.
     """
+    _deny_registered_worker_filesystem_control_plane()
     if db_path is not None:
         path = db_path
     else:
@@ -3107,6 +3246,306 @@ _BUSY_MAX_RETRIES = 5
 _BUSY_RETRY_MIN_S = 0.020  # 20ms
 _BUSY_RETRY_MAX_S = 0.150  # 150ms
 
+_AUTH_SENTINEL = object()
+_WRITE_TXN_STACK: ContextVar[tuple[tuple[int, str], ...]] = ContextVar(
+    "hermes_write_txn_stack",
+    default=(),
+)
+
+
+class FencedTargetError(StaleAttemptError):
+    """Raised when a caller does not own a fenced mutation target."""
+
+
+class CrossBoardWorkerMutationError(StaleAttemptError):
+    """Raised when a registered worker addresses a different board."""
+
+
+class RegisteredWorkerControlPlaneError(StaleAttemptError):
+    """Raised when a worker process group invokes a control-plane mutation."""
+
+
+@dataclass(frozen=True)
+class _MutationAuthorization:
+    sentinel: object
+    mode: Literal["manual", "worker"]
+    board_db_identity: str
+    connection_id: int
+    transaction_token: str
+    provenance: ProcessProvenance | None
+
+
+def _board_db_identity(conn: sqlite3.Connection) -> str:
+    row = conn.execute("PRAGMA database_list").fetchone()
+    if row is None:
+        raise StaleAttemptError("kanban connection has no main database")
+    try:
+        raw_path = row["file"]
+    except (IndexError, TypeError):
+        raw_path = row[2]
+    if type(raw_path) is not str or not raw_path:
+        raise StaleAttemptError("kanban connection database identity is unavailable")
+    try:
+        return str(Path(raw_path).resolve(strict=True))
+    except OSError as exc:
+        raise StaleAttemptError("kanban connection database cannot be resolved") from exc
+
+
+def _active_write_txn_token(conn: sqlite3.Connection) -> str:
+    for connection_id, token in reversed(_WRITE_TXN_STACK.get()):
+        if connection_id == id(conn):
+            return token
+    raise RuntimeError("mutation authorization requires active write_txn")
+
+
+def _validate_current_worker_attempt_locked(
+    conn: sqlite3.Connection,
+    provenance: ProcessProvenance,
+) -> None:
+    board_identity = _board_db_identity(conn)
+    try:
+        provenance_board = str(Path(provenance.board_db_path).resolve(strict=True))
+    except OSError as exc:
+        raise StaleAttemptError("registered worker board cannot be resolved") from exc
+    if provenance_board != board_identity:
+        raise CrossBoardWorkerMutationError(
+            "registered worker cannot mutate a different kanban board"
+        )
+
+    leader = provenance.leader_identity
+    cursor = conn.execute(
+        """
+        UPDATE tasks
+           SET id = id
+         WHERE id = ?
+           AND status = 'running'
+           AND current_run_id = ?
+           AND claim_lock = ?
+           AND worker_pid = ?
+           AND worker_pgid = ?
+           AND worker_identity = ?
+           AND worker_fence = ?
+        """,
+        (
+            provenance.task_id,
+            provenance.run_id,
+            provenance.claim_lock,
+            leader.pid,
+            leader.pgid,
+            leader.token,
+            provenance.raw_fence,
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise StaleAttemptError("worker task ownership changed before mutation")
+    run = conn.execute(
+        """
+        SELECT task_id, status, claim_lock, worker_pid, worker_pgid,
+               worker_identity, worker_fence
+          FROM task_runs
+         WHERE id = ?
+        """,
+        (provenance.run_id,),
+    ).fetchone()
+    if run is None or (
+        run["task_id"] != provenance.task_id
+        or run["status"] != "running"
+        or run["claim_lock"] != provenance.claim_lock
+        or run["worker_pid"] != leader.pid
+        or run["worker_pgid"] != leader.pgid
+        or run["worker_identity"] != leader.token
+        or run["worker_fence"] != provenance.raw_fence
+    ):
+        raise StaleAttemptError("worker run ownership changed before mutation")
+
+
+def _validate_authorization_targets(
+    conn: sqlite3.Connection,
+    authorization: _MutationAuthorization,
+    target_task_ids: tuple[str, ...],
+    *,
+    allow_unfenced_worker_targets: bool = False,
+) -> None:
+    target_ids = tuple(sorted({task_id for task_id in target_task_ids if task_id}))
+    if not target_ids:
+        return
+    placeholders = ",".join("?" for _ in target_ids)
+    rows = conn.execute(
+        f"SELECT id, worker_fence FROM tasks WHERE id IN ({placeholders})",
+        target_ids,
+    ).fetchall()
+    provenance_task = (
+        authorization.provenance.task_id
+        if authorization.provenance is not None
+        else None
+    )
+    for row in rows:
+        if (
+            authorization.mode == "worker"
+            and row["id"] != provenance_task
+            and not allow_unfenced_worker_targets
+        ):
+            raise FencedTargetError(
+                f"registered worker cannot mutate task {row['id']}"
+            )
+        if row["worker_fence"] is None:
+            continue
+        if authorization.mode == "worker" and row["id"] == provenance_task:
+            continue
+        raise FencedTargetError(
+            f"mutation target {row['id']} is owned by another fenced attempt"
+        )
+
+
+def _authorize_mutation_locked(
+    conn: sqlite3.Connection,
+    *,
+    target_task_ids: tuple[str, ...],
+    prepared_provenance: ProcessProvenance | None,
+    existing: _MutationAuthorization | None = None,
+    allow_unfenced_worker_targets: bool = False,
+) -> _MutationAuthorization:
+    token = _active_write_txn_token(conn)
+    board_identity = _board_db_identity(conn)
+    if existing is not None:
+        if (
+            existing.sentinel is not _AUTH_SENTINEL
+            or existing.connection_id != id(conn)
+            or existing.board_db_identity != board_identity
+            or existing.transaction_token != token
+        ):
+            raise StaleAttemptError("invalid scoped mutation authorization")
+        _validate_authorization_targets(
+            conn,
+            existing,
+            target_task_ids,
+            allow_unfenced_worker_targets=True,
+        )
+        return existing
+
+    if prepared_provenance is None:
+        authorization = _MutationAuthorization(
+            _AUTH_SENTINEL,
+            "manual",
+            board_identity,
+            id(conn),
+            token,
+            None,
+        )
+    else:
+        _validate_current_worker_attempt_locked(conn, prepared_provenance)
+        authorization = _MutationAuthorization(
+            _AUTH_SENTINEL,
+            "worker",
+            board_identity,
+            id(conn),
+            token,
+            prepared_provenance,
+        )
+    _validate_authorization_targets(
+        conn,
+        authorization,
+        target_task_ids,
+        allow_unfenced_worker_targets=allow_unfenced_worker_targets,
+    )
+    return authorization
+
+
+@contextlib.contextmanager
+def _authorized_write_txn(
+    conn: sqlite3.Connection,
+    target_task_ids: tuple[str, ...],
+    *,
+    existing: _MutationAuthorization | None = None,
+):
+    """Open a write transaction and authorize its exact mutation targets."""
+    prepared_provenance = (
+        existing.provenance if existing is not None else _prepare_mutation_provenance()
+    )
+    with write_txn(conn, allow_nested=existing is not None):
+        authorization = _authorize_mutation_locked(
+            conn,
+            target_task_ids=target_task_ids,
+            prepared_provenance=prepared_provenance,
+            existing=existing,
+        )
+        yield authorization
+
+
+def _prepare_mutation_provenance() -> ProcessProvenance | None:
+    """Discover process-group authority without trusting routing environment."""
+    if sys.platform != "darwin":
+        # Component-A dispatch is denied before claim/spawn on unsupported
+        # platforms, so a non-Darwin DB caller can only be a manual/CI caller.
+        return None
+    caller_pid = os.getpid()
+    caller_pgid = os.getpgid(0)
+    caller_identity = _darwin_process_identity(caller_pid)
+    if caller_identity is None or caller_identity.pgid != caller_pgid:
+        raise StaleAttemptError("caller process identity is unavailable")
+    paths = _canonical_board_db_paths()
+    if len(paths) > MAX_CANONICAL_BOARD_DBS:
+        raise AttemptFenceInventoryOverflow(
+            f"canonical board inventory has {len(paths)} databases; "
+            f"maximum is {MAX_CANONICAL_BOARD_DBS}"
+        )
+    matches = []
+    for path in paths:
+        try:
+            matches.extend(
+                (path, row)
+                for row in _read_registration_rows(path, caller_pgid)
+            )
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "no such table" in message or "no such column" in message:
+                # A canonical pre-fence DB cannot contain a worker
+                # registration.  Manual init/migration must remain reachable,
+                # while every DB with the fence schema is still scanned.
+                continue
+            raise StaleAttemptError(
+                "canonical board registration scan failed"
+            ) from exc
+        except sqlite3.Error as exc:
+            raise StaleAttemptError(
+                "canonical board registration scan failed"
+            ) from exc
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise StaleAttemptError("caller process group has ambiguous registrations")
+    path, row = matches[0]
+    return _validated_provenance(path, row, caller_identity)
+
+
+def _deny_registered_worker_control_plane_locked(
+    conn: sqlite3.Connection,
+    prepared_provenance: ProcessProvenance | None,
+) -> None:
+    """Reject control-plane entry from any registered worker process group."""
+    _active_write_txn_token(conn)
+    if prepared_provenance is None:
+        return
+    _validate_current_worker_attempt_locked(conn, prepared_provenance)
+    raise RegisteredWorkerControlPlaneError(
+        "registered workers cannot invoke kanban control-plane mutations"
+    )
+
+
+def _deny_registered_worker_control_plane(conn: sqlite3.Connection) -> None:
+    """Bind registered-worker control-plane denial to a write transaction."""
+    prepared_provenance = _prepare_mutation_provenance()
+    with write_txn(conn):
+        _deny_registered_worker_control_plane_locked(conn, prepared_provenance)
+
+
+def _deny_registered_worker_filesystem_control_plane() -> None:
+    """Reject a registered worker before a control-plane filesystem write."""
+    if _prepare_mutation_provenance() is not None:
+        raise RegisteredWorkerControlPlaneError(
+            "registered workers cannot invoke kanban control-plane mutations"
+        )
+
 
 def _is_busy_error(exc: BaseException) -> bool:
     return isinstance(exc, sqlite3.OperationalError) and (
@@ -3174,31 +3613,39 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         return
 
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    transaction_token = secrets.token_hex(16)
+    stack = _WRITE_TXN_STACK.get()
+    reset_handle = _WRITE_TXN_STACK.set(
+        (*stack, (id(conn), transaction_token))
+    )
     try:
-        yield conn
-    except Exception:
         try:
-            conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
-            # SQLite has already auto-rolled-back the transaction (typical
-            # under EIO, lock contention, or corruption). Nothing to undo;
-            # do not let this secondary failure shadow the real one.
-            pass
-        raise
-    else:
-        try:
-            _execute_boundary_with_retry(conn, "COMMIT")
+            yield conn
         except Exception:
-            # COMMIT exhausted retries with the txn still open; roll back so the
-            # connection isn't poisoned for the next BEGIN IMMEDIATE.
             try:
                 conn.execute("ROLLBACK")
             except sqlite3.OperationalError:
+                # SQLite has already auto-rolled-back the transaction (typical
+                # under EIO, lock contention, or corruption). Nothing to undo;
+                # do not let this secondary failure shadow the real error.
                 pass
             raise
-        # Post-commit file-length check: header page_count must match actual file pages.
-        # A discrepancy means a torn-extend — raise now rather than silently corrupt.
-        _check_file_length_invariant(conn)
+        else:
+            try:
+                _execute_boundary_with_retry(conn, "COMMIT")
+            except Exception:
+                # COMMIT exhausted retries with the txn still open; roll back so the
+                # connection isn't poisoned for the next BEGIN IMMEDIATE.
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
+            # Post-commit file-length check: header page_count must match actual file pages.
+            # A discrepancy means a torn-extend — raise now rather than silently corrupt.
+            _check_file_length_invariant(conn)
+    finally:
+        _WRITE_TXN_STACK.reset(reset_handle)
 
 
 # ---------------------------------------------------------------------------
@@ -3269,6 +3716,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    _mutation_auth: _MutationAuthorization | None = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3479,6 +3927,10 @@ def create_task(
             )
         skills_list = cleaned
 
+    prepared_provenance = (
+        None if _mutation_auth is not None else _prepare_mutation_provenance()
+    )
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -3492,6 +3944,13 @@ def create_task(
             (idempotency_key,),
         ).fetchone()
         if row:
+            with write_txn(conn, allow_nested=True):
+                _authorize_mutation_locked(
+                    conn,
+                    target_task_ids=(row["id"],),
+                    prepared_provenance=prepared_provenance,
+                    existing=_mutation_auth,
+                )
             return row["id"]
 
     now = int(time.time())
@@ -3524,6 +3983,12 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
+                _authorize_mutation_locked(
+                    conn,
+                    target_task_ids=tuple(parents),
+                    prepared_provenance=prepared_provenance,
+                    existing=_mutation_auth,
+                )
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3792,7 +4257,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Reassign after the current run completes if needed.
     """
     profile = _canonical_assignee(profile)
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -3847,7 +4312,7 @@ def set_model_override(
         raise ValueError("provider_override requires a model_override")
     if not model:
         provider = None
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -3886,7 +4351,7 @@ def set_reasoning_effort(
     running task. Returns True on success.
     """
     effort = normalize_reasoning_effort(effort)
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -3915,7 +4380,14 @@ def set_reasoning_effort(
 def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
+    prepared_provenance = _prepare_mutation_provenance()
     with write_txn(conn):
+        _authorize_mutation_locked(
+            conn,
+            target_task_ids=(parent_id, child_id),
+            prepared_provenance=prepared_provenance,
+            allow_unfenced_worker_targets=True,
+        )
         missing = _find_missing_parents(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
@@ -3967,7 +4439,14 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+    prepared_provenance = _prepare_mutation_provenance()
     with write_txn(conn):
+        _authorize_mutation_locked(
+            conn,
+            target_task_ids=(parent_id, child_id),
+            prepared_provenance=prepared_provenance,
+            allow_unfenced_worker_targets=True,
+        )
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
             (parent_id, child_id),
@@ -4072,10 +4551,16 @@ def add_comment(
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    prepared_provenance = _prepare_mutation_provenance()
     now = int(time.time())
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
+        _authorize_mutation_locked(
+            conn,
+            target_task_ids=(task_id,),
+            prepared_provenance=prepared_provenance,
+        )
         task_row = conn.execute(
             "SELECT status, current_run_id, worker_fence FROM tasks WHERE id = ?",
             (task_id,),
@@ -4235,28 +4720,30 @@ def store_attachment_bytes(
             f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
         )
     safe_name = _safe_attachment_name(filename)
-    dest_dir = task_attachments_dir(task_id, board=board)
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = _collision_free_path(dest_dir, safe_name)
-    dest_path.write_bytes(data)
-    try:
-        return add_attachment(
-            conn,
-            task_id,
-            filename=dest_path.name,
-            stored_path=str(dest_path.resolve()),
-            content_type=content_type,
-            size=len(data),
-            uploaded_by=uploaded_by,
-        )
-    except Exception:
-        # Don't leave an orphan blob if the metadata insert fails (most
-        # commonly: the task id doesn't exist).
+    with _authorized_write_txn(conn, (task_id,)) as authorization:
+        dest_dir = task_attachments_dir(task_id, board=board)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = _collision_free_path(dest_dir, safe_name)
+        dest_path.write_bytes(data)
         try:
-            dest_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+            return add_attachment(
+                conn,
+                task_id,
+                filename=dest_path.name,
+                stored_path=str(dest_path.resolve()),
+                content_type=content_type,
+                size=len(data),
+                uploaded_by=uploaded_by,
+                _mutation_auth=authorization,
+            )
+        except Exception:
+            # Don't leave an orphan blob if the metadata insert fails (most
+            # commonly: the task id doesn't exist).
+            try:
+                dest_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
 
 def add_attachment(
@@ -4268,6 +4755,7 @@ def add_attachment(
     content_type: Optional[str] = None,
     size: int = 0,
     uploaded_by: Optional[str] = None,
+    _mutation_auth: Optional[_MutationAuthorization] = None,
 ) -> int:
     """Record a file attachment for a task. Returns the new attachment id.
 
@@ -4280,7 +4768,9 @@ def add_attachment(
     if not stored_path or not stored_path.strip():
         raise ValueError("attachment stored_path is required")
     now = int(time.time())
-    with write_txn(conn):
+    with _authorized_write_txn(
+        conn, (task_id,), existing=_mutation_auth,
+    ):
         if not conn.execute(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
@@ -4353,10 +4843,16 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
     (a missing file is not an error); the metadata row is the source of
     truth for whether an attachment "exists".
     """
+    prepared_provenance = _prepare_mutation_provenance()
     with write_txn(conn):
         att = get_attachment(conn, attachment_id)
         if att is None:
             return None
+        _authorize_mutation_locked(
+            conn,
+            target_task_ids=(att.task_id,),
+            prepared_provenance=prepared_provenance,
+        )
         conn.execute("DELETE FROM task_attachments WHERE id = ?", (attachment_id,))
         _append_event(
             conn, att.task_id, "attachment_removed", {"filename": att.filename}
@@ -4636,6 +5132,7 @@ def reap_terminal_attempt_fences(
     limit: int = TERMINAL_FENCE_REAP_LIMIT,
 ) -> list[tuple[Literal["task", "run"], str | int]]:
     """Reap at most ``limit`` proven-dead terminal attempt fences once."""
+    _deny_registered_worker_control_plane(conn)
     bounded_limit = max(0, min(int(limit), TERMINAL_FENCE_REAP_LIMIT))
     if bounded_limit == 0:
         return []
@@ -4852,7 +5349,10 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 
 
 def recompute_ready(
-    conn: sqlite3.Connection, failure_limit: int = None,
+    conn: sqlite3.Connection,
+    failure_limit: int = None,
+    *,
+    _mutation_auth: Optional[_MutationAuthorization] = None,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
@@ -4886,12 +5386,23 @@ def recompute_ready(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
-    with write_txn(conn):
+    prepared_provenance = (
+        _mutation_auth.provenance
+        if _mutation_auth is not None
+        else _prepare_mutation_provenance()
+    )
+    with write_txn(conn, allow_nested=_mutation_auth is not None):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked') "
             "AND worker_fence IS NULL"
         ).fetchall()
+        _authorize_mutation_locked(
+            conn,
+            target_task_ids=tuple(row["id"] for row in todo_rows),
+            prepared_provenance=prepared_provenance,
+            existing=_mutation_auth,
+        )
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
@@ -4979,7 +5490,9 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    prepared_provenance = _prepare_mutation_provenance()
     with write_txn(conn):
+        _deny_registered_worker_control_plane_locked(conn, prepared_provenance)
         fenced = conn.execute(
             "SELECT worker_fence FROM tasks WHERE id = ?",
             (task_id,),
@@ -5111,6 +5624,7 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
+    _deny_registered_worker_control_plane(conn)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -5291,7 +5805,8 @@ def heartbeat_claim(
     """
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
-    with write_txn(conn):
+    prepared_provenance = _prepare_mutation_provenance()
+    with _authorized_write_txn(conn, (task_id,)) as authorization:
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
             "WHERE id = ? AND status = 'running' AND claim_lock = ?",
@@ -5411,6 +5926,7 @@ def release_stale_claims(
     Returns the number of stale claims actually reclaimed (live-pid
     extensions don't count). Safe to call often.
     """
+    _deny_registered_worker_control_plane(conn)
     now = int(time.time())
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -5598,6 +6114,7 @@ def reclaim_task(
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist).
     """
+    _deny_registered_worker_control_plane(conn)
     row = conn.execute(
         "SELECT id, status, current_run_id, claim_lock, worker_pid, "
         "worker_pgid, worker_identity, worker_fence, "
@@ -5704,6 +6221,7 @@ def reassign_task(
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
     """
+    _deny_registered_worker_control_plane(conn)
     if reclaim_first:
         target = conn.execute(
             "SELECT worker_fence FROM tasks WHERE id=?",
@@ -5911,6 +6429,7 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    prepared_provenance = _prepare_mutation_provenance()
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
@@ -5928,6 +6447,11 @@ def complete_task(
         )
         if phantom_cards:
             with write_txn(conn):
+                _authorize_mutation_locked(
+                    conn,
+                    target_task_ids=(task_id,),
+                    prepared_provenance=prepared_provenance,
+                )
                 _append_event(
                     conn, task_id, "completion_blocked_hallucination",
                     {
@@ -5947,7 +6471,7 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)) as authorization:
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
@@ -6074,6 +6598,27 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        scan_text = " ".join(filter(None, [summary, result]))
+        if scan_text:
+            phantom_refs = _scan_prose_for_phantom_ids(conn, scan_text)
+            phantom_refs = [
+                p for p in phantom_refs if p not in set(verified_cards)
+            ]
+            if phantom_refs:
+                _append_event(
+                    conn,
+                    task_id,
+                    "suspected_hallucinated_references",
+                    {
+                        "phantom_refs": phantom_refs,
+                        "source": "completion_summary",
+                    },
+                    run_id=run_id,
+                )
+        _clear_failure_counter(
+            conn, task_id, _mutation_auth=authorization,
+        )
+        recompute_ready(conn, _mutation_auth=authorization)
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -6085,23 +6630,13 @@ def complete_task(
         # above (shouldn't happen — verified means they exist — but
         # belt-and-suspenders).
         phantom_refs = [p for p in phantom_refs if p not in set(verified_cards)]
-        if phantom_refs:
-            with write_txn(conn):
-                _append_event(
-                    conn, task_id, "suspected_hallucinated_references",
-                    {
-                        "phantom_refs": phantom_refs,
-                        "source": "completion_summary",
-                    },
-                    run_id=run_id,
-                )
+        # The warning event was persisted inside the authorized terminal
+        # transaction above; this post-commit scan is read-only compatibility.
     # Successful completion — wipe the consecutive-failures counter.
     # Failure history stays on the event log for audit; the counter
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
-    _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
-    recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -6713,7 +7248,7 @@ def edit_completed_task_result(
 ) -> bool:
     """Backfill the user-visible result for an already completed task."""
     handoff_summary = summary if summary is not None else result
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
@@ -6807,8 +7342,14 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    prepared_provenance = _prepare_mutation_provenance()
     recurrences = 0
     with write_txn(conn):
+        _authorize_mutation_locked(
+            conn,
+            target_task_ids=(task_id,),
+            prepared_provenance=prepared_provenance,
+        )
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences, worker_fence "
             "FROM tasks WHERE id = ?",
@@ -7067,7 +7608,7 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
@@ -7220,7 +7761,7 @@ def request_changes(
     if not reason:
         return False, "reason is required"
 
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         task_row = conn.execute(
             "SELECT status, assignee, current_run_id, worker_fence "
             "FROM tasks WHERE id = ?",
@@ -7381,7 +7922,7 @@ def promote_task(
     if dry_run:
         return True, None
 
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
@@ -7459,7 +8000,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     state) holds for the rest of this function's lifetime.
     """
     now = int(time.time())
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         current = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -7524,7 +8065,7 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     clears it.) Returns False when the task is missing or not in ``review``.
     """
     now = int(time.time())
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         _reclaim_dangling_run(
             conn, task_id, statuses=("review",), now=now,
             note="invariant recovery on review reopen",
@@ -7642,6 +8183,7 @@ def invalidate_descendants_for_parent_reopen(
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
     terminations: list[tuple[Optional[int], Optional[str]]] = []
+    prepared_provenance = _prepare_mutation_provenance()
     with write_txn(conn, allow_nested=True):
         rows = conn.execute(
             """
@@ -7659,6 +8201,11 @@ def invalidate_descendants_for_parent_reopen(
             """,
             (task_id,),
         ).fetchall()
+        _authorize_mutation_locked(
+            conn,
+            target_task_ids=(task_id, *(row["id"] for row in rows)),
+            prepared_provenance=prepared_provenance,
+        )
         for row in rows:
             previous_status = row["status"]
             if previous_status not in {"ready", "review", "running", "done"}:
@@ -7775,7 +8322,7 @@ def specify_triage_task(
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)) as authorization:
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
@@ -7829,12 +8376,12 @@ def specify_triage_task(
             "specified",
             {"changed_fields": changed_fields} if changed_fields else None,
         )
+        recompute_ready(conn, _mutation_auth=authorization)
     # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
     # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
     # logic the dispatcher would on its next tick, so a specified task
     # with no open parents flips straight to 'ready' here instead of
     # idling in 'todo' until the next sweep.
-    recompute_ready(conn)
     return True
 
 
@@ -7929,7 +8476,7 @@ def decompose_triage_task(
     # _append_event calls.
     now = int(time.time())
     child_ids: list[str] = []
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)) as authorization:
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?",
@@ -8061,18 +8608,19 @@ def decompose_triage_task(
             },
         )
 
+        if auto_promote:
+            recompute_ready(conn, _mutation_auth=authorization)
+
     # Outside the write_txn: promote parent-free children to 'ready'
     # so the dispatcher picks them up on its next tick. Same pattern
     # specify_triage_task uses.  When auto_promote is False children
     # stay in 'todo' until the user manually promotes them — useful
     # for manual-review-first workflows.
-    if auto_promote:
-        recompute_ready(conn)
     return child_ids
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)) as authorization:
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -8090,10 +8638,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
-    # ``archived`` parents no longer block children, same as ``done``.
-    # Promote newly-unblocked dependents immediately instead of waiting
-    # for a later dispatcher tick.
-    recompute_ready(conn)
+        recompute_ready(conn, _mutation_auth=authorization)
     # Reap the workspace on archive too — tasks archived without ever
     # completing previously kept their scratch dir / worktree forever.
     _cleanup_workspace(conn, task_id)
@@ -8107,7 +8652,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     tasks must be explicitly archived first so accidental data loss requires a
     second deliberate action.
     """
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -8136,7 +8681,11 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     Returns ``True`` if the task existed and was deleted, ``False``
     if the task was not found.
     """
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)) as authorization:
+        if authorization.mode == "worker":
+            raise RegisteredWorkerControlPlaneError(
+                "registered workers cannot delete their own registration row"
+            )
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -8145,7 +8694,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-    recompute_ready(conn)
+        recompute_ready(conn, _mutation_auth=authorization)
     return True
 
 
@@ -8455,7 +9004,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> None:
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         conn.execute(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
             (str(path), task_id),
@@ -8465,7 +9014,7 @@ def set_workspace_path(
 def set_branch_name(
     conn: sqlite3.Connection, task_id: str, branch_name: str
 ) -> None:
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         conn.execute(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
             (str(branch_name), task_id),
@@ -8486,7 +9035,7 @@ def schedule_task(
     human action, or automation can later call ``unblock_task`` to re-gate them
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -8948,7 +9497,7 @@ def heartbeat_worker(
     should be heartbeating (not running, or claim expired).
     """
     now = int(time.time())
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         if expected_run_id is None:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
@@ -8999,6 +9548,7 @@ def enforce_max_runtime(
     test hook; defaults to ``os.kill`` on POSIX.
     """
     import signal
+    _deny_registered_worker_control_plane(conn)
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -9137,6 +9687,7 @@ def detect_stale_running(
     immediately).  ``signal_fn`` is a test hook; defaults to ``os.kill``
     on POSIX.
     """
+    _deny_registered_worker_control_plane(conn)
     if stale_timeout_seconds <= 0:
         return []
 
@@ -9265,6 +9816,7 @@ def reconcile_orphaned_running(
     """
     now = int(time.time())
     reconciled: list[str] = []
+    _deny_registered_worker_control_plane(conn)
     rows = conn.execute(
         "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
         "WHERE status = 'running' "
@@ -9441,6 +9993,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
     """
+    _deny_registered_worker_control_plane(conn)
     crashed: list[str] = []
     rate_limited: list[str] = []
     # Per-crash details collected inside the main txn, used after it
@@ -9773,7 +10326,7 @@ def _record_task_failure(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
@@ -9941,7 +10494,12 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
 
 
-def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
+def _clear_failure_counter(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    _mutation_auth: Optional[_MutationAuthorization] = None,
+) -> None:
     """Reset the unified consecutive-failures counter.
 
     Called from ``complete_task`` on successful completion — a fresh
@@ -9951,7 +10509,9 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     about whether the run will succeed, so we need to let timeouts and
     crashes accumulate across spawn boundaries.
     """
-    with write_txn(conn):
+    with _authorized_write_txn(
+        conn, (task_id,), existing=_mutation_auth,
+    ):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 0, "
             "last_failure_error = NULL WHERE id = ?",
@@ -10412,6 +10972,7 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    _deny_registered_worker_control_plane(conn)
     if not dry_run:
         _require_attempt_fence_platform()
     try:
@@ -11526,6 +12087,7 @@ def run_daemon(
     dispatcher and ``hermes kanban dispatch`` — the standalone daemon must
     not be the one uncapped entry point (OOF-30).
     """
+    _deny_registered_worker_filesystem_control_plane()
     import signal
     import threading
 
@@ -12018,7 +12580,7 @@ def add_notify_sub(
     insert_chat_type = chat_type or "dm"
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
@@ -12241,7 +12803,7 @@ def remove_notify_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
 ) -> bool:
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id = ? "
             "AND platform = ? AND chat_id = ? AND thread_id = ?",
@@ -12367,7 +12929,7 @@ def claim_unseen_events_for_sub(
     ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
     failed before any terminal unsubscribe removed the row.
     """
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         row = conn.execute(
             "SELECT last_event_id FROM kanban_notify_subs "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
@@ -12404,7 +12966,7 @@ def advance_notify_cursor(
     thread_id: Optional[str] = None,
     new_cursor: int,
 ) -> None:
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
@@ -12428,7 +12990,7 @@ def rewind_notify_cursor(
     claim. This keeps retry behavior for transient send failures without
     clobbering newer progress.
     """
-    with write_txn(conn):
+    with _authorized_write_txn(conn, (task_id,)):
         cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
@@ -12452,6 +13014,7 @@ def gc_events(
     in a terminal state (``done`` or ``archived``). Returns the number of
     rows deleted. Running / ready / blocked tasks keep their full event
     history."""
+    _deny_registered_worker_control_plane(conn)
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
@@ -12471,6 +13034,7 @@ def gc_worker_logs(
     log files live on disk, not in SQLite. Scoped to ``board`` (defaults
     to the active board) — per-board isolation means deleting logs from
     board A cannot touch board B's logs."""
+    _deny_registered_worker_filesystem_control_plane()
     log_dir = worker_logs_dir(board=board)
     if not log_dir.exists():
         return 0

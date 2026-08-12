@@ -26,6 +26,33 @@ darwin_only = pytest.mark.skipif(
 )
 
 
+@pytest.fixture
+def registered_other_group(isolated_home):
+    leader = subprocess.Popen(["/bin/sleep", "60"], process_group=0)
+    identity = kb._darwin_process_identity(leader.pid)
+    assert identity is not None
+    conn = kb.connect()
+    task_id, claimed, raw_fence = create_bound_attempt(
+        conn, leader_identity=identity,
+    )
+    fixture = type("RegisteredOtherGroup", (), {})()
+    fixture.conn = conn
+    fixture.task_id = task_id
+    fixture.claimed = claimed
+    fixture.raw_fence = raw_fence
+    fixture.board_path = Path(conn.execute("PRAGMA database_list").fetchone()["file"])
+    fixture.identity = identity
+    try:
+        yield fixture
+    finally:
+        conn.close()
+        try:
+            os.killpg(identity.pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        leader.wait(timeout=5)
+
+
 @darwin_only
 def test_libproc_identity_has_microsecond_start_and_pgid():
     identity = kb._darwin_process_identity(os.getpid())
@@ -98,10 +125,8 @@ def test_claim_task_rejects_fenced_retry_state_with_zero_delta(
     fixture.conn.commit()
     before = logical_board_snapshot(fixture.conn)
 
-    assert (
+    with pytest.raises(kb.StaleAttemptError):
         kb.claim_task(fixture.conn, fixture.task_id, claimer="second:claim")
-        is None
-    )
     assert logical_board_snapshot(fixture.conn) == before
 
 
@@ -123,11 +148,12 @@ def test_claim_with_fence_precedes_dependency_demote_and_run_cleanup(
     fixture.conn.commit()
     before = logical_board_snapshot(fixture.conn)
 
-    assert kb.claim_task(
-        fixture.conn,
-        fixture.task_id,
-        claimer="second:claim",
-    ) is None
+    with pytest.raises(kb.StaleAttemptError):
+        kb.claim_task(
+            fixture.conn,
+            fixture.task_id,
+            claimer="second:claim",
+        )
     assert logical_board_snapshot(fixture.conn) == before
 
 
@@ -151,11 +177,12 @@ def test_claim_task_rejects_any_fenced_non_ready_status_with_zero_delta(
     fixture.conn.commit()
     before = logical_board_snapshot(fixture.conn)
 
-    assert kb.claim_task(
-        fixture.conn,
-        fixture.task_id,
-        claimer="second:claim",
-    ) is None
+    with pytest.raises(kb.StaleAttemptError):
+        kb.claim_task(
+            fixture.conn,
+            fixture.task_id,
+            claimer="second:claim",
+        )
     assert logical_board_snapshot(fixture.conn) == before
 
 
@@ -172,14 +199,12 @@ def test_claim_review_task_rejects_fenced_retry_state_with_zero_delta(
     fixture.conn.commit()
     before = logical_board_snapshot(fixture.conn)
 
-    assert (
+    with pytest.raises(kb.StaleAttemptError):
         kb.claim_review_task(
             fixture.conn,
             fixture.task_id,
             claimer="second:review",
         )
-        is None
-    )
     assert logical_board_snapshot(fixture.conn) == before
 
 
@@ -190,6 +215,136 @@ def _run_process_tuple(conn, run_id):
         (run_id,),
     ).fetchone()
     return tuple(row)
+
+
+def _external_reap(db_path: Path, *, limit: int = 16, forced_state=None):
+    """Run the dispatcher-only reaper from an unregistered process group."""
+    script = """
+import json
+import sys
+from pathlib import Path
+from hermes_cli import kanban_db as kb
+
+forced = json.loads(sys.argv[3])
+if forced is not None:
+    kb._fenced_group_state = lambda _fence: forced
+with kb.connect_closing(Path(sys.argv[1])) as conn:
+    print(json.dumps(kb.reap_terminal_attempt_fences(conn, limit=int(sys.argv[2]))))
+"""
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(db_path),
+            str(limit),
+            json.dumps(forced_state),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        start_new_session=True,
+    )
+    return [tuple(item) for item in json.loads(completed.stdout.strip())]
+
+
+def _external_reap_with_run_identity_race(db_path: Path, run_id: int):
+    script = """
+import json
+import sys
+from pathlib import Path
+from hermes_cli import kanban_db as kb
+
+with kb.connect_closing(Path(sys.argv[1])) as conn:
+    def race(_fence):
+        conn.execute(
+            "UPDATE task_runs SET worker_identity='raced:identity' WHERE id=?",
+            (int(sys.argv[2]),),
+        )
+        conn.commit()
+        return "dead"
+    kb._fenced_group_state = race
+    print(json.dumps(kb.reap_terminal_attempt_fences(conn, limit=16)))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(db_path), str(run_id)],
+        check=True,
+        capture_output=True,
+        text=True,
+        start_new_session=True,
+    )
+    return [tuple(item) for item in json.loads(completed.stdout.strip())]
+
+
+def _external_recompute(db_path: Path) -> int:
+    script = """
+import sys
+from pathlib import Path
+from hermes_cli import kanban_db as kb
+with kb.connect_closing(Path(sys.argv[1])) as conn:
+    print(kb.recompute_ready(conn))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(db_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+        start_new_session=True,
+    )
+    return int(completed.stdout.strip())
+
+
+def _bind_second_attempt_from_external_dispatcher(fixture, identity):
+    task_id = kb.create_task(fixture.conn, title="second fenced", assignee="dor-coo")
+    script = """
+import json
+import sys
+from pathlib import Path
+from hermes_cli import kanban_db as kb
+with kb.connect_closing(Path(sys.argv[1])) as conn:
+    task = kb.claim_task(conn, sys.argv[2], claimer="external:fixture")
+    print(json.dumps({"run_id": task.current_run_id, "claim_lock": task.claim_lock}))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(fixture.board_path), task_id],
+        check=True,
+        capture_output=True,
+        text=True,
+        start_new_session=True,
+    )
+    claimed = json.loads(completed.stdout.strip())
+    raw_fence = json.dumps(
+        {
+            "run_id": claimed["run_id"],
+            "claim_lock": claimed["claim_lock"],
+            "host": kb._host_id(),
+            "leader_pid": identity.pid,
+            "worker_pgid": identity.pgid,
+            "worker_identity": identity.token,
+            "reason": "running",
+            "created_at": 1,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    fixture.conn.execute(
+        "UPDATE tasks SET worker_pid=?, worker_pgid=?, worker_identity=?, "
+        "worker_fence=? WHERE id=?",
+        (identity.pid, identity.pgid, identity.token, raw_fence, task_id),
+    )
+    fixture.conn.execute(
+        "UPDATE task_runs SET worker_pid=?, worker_pgid=?, worker_identity=?, "
+        "worker_fence=? WHERE id=?",
+        (
+            identity.pid,
+            identity.pgid,
+            identity.token,
+            raw_fence,
+            claimed["run_id"],
+        ),
+    )
+    fixture.conn.commit()
+    return task_id, claimed, raw_fence
 
 
 @pytest.mark.parametrize("operation", ["complete", "block", "gave_up"])
@@ -243,7 +398,7 @@ def test_terminal_transition_preserves_fenced_process_tuple(
     assert run["outcome"] == expected_outcome
     assert process_tuple(task) == before_task_tuple
     assert _run_process_tuple(fixture.conn, run_id) == before_run_tuple
-    assert kb.reap_terminal_attempt_fences(fixture.conn, limit=16) == []
+    assert _external_reap(fixture.board_path, limit=16) == []
     before_late_call = logical_board_snapshot(fixture.conn)
     with pytest.raises(kb.StaleAttemptError):
         kb.add_comment(fixture.conn, fixture.task_id, "dor-coo", "late")
@@ -281,7 +436,7 @@ def test_dependency_block_and_promotion_stay_hidden_until_exact_reap(
     assert process_tuple(task) == before_tuple
     assert run["outcome"] == "blocked"
     assert json.loads(run["metadata"])["retry_status"] == "todo"
-    assert kb.reap_terminal_attempt_fences(fixture.conn) == []
+    assert _external_reap(fixture.board_path) == []
 
     fixture.conn.execute(
         "UPDATE tasks SET status='done' WHERE id=?",
@@ -289,15 +444,15 @@ def test_dependency_block_and_promotion_stay_hidden_until_exact_reap(
     )
     fixture.conn.commit()
     before_promotion = logical_board_snapshot(fixture.conn)
-    assert kb.recompute_ready(fixture.conn) == 0
+    assert _external_recompute(fixture.board_path) == 0
     assert logical_board_snapshot(fixture.conn) == before_promotion
 
     monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: "dead")
-    assert kb.reap_terminal_attempt_fences(fixture.conn) == [
+    assert _external_reap(fixture.board_path, forced_state="dead") == [
         ("task", fixture.task_id)
     ]
     assert kb.get_task(fixture.conn, fixture.task_id).status == "todo"
-    assert kb.recompute_ready(fixture.conn) == 1
+    assert _external_recompute(fixture.board_path) == 1
     assert kb.get_task(fixture.conn, fixture.task_id).status == "ready"
 
 
@@ -428,7 +583,9 @@ def test_orphan_spawn_bind_failure_reaps_only_old_run(
     before_new_run = _run_process_tuple(fixture.conn, newer.current_run_id)
     monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: "dead")
 
-    assert kb.reap_terminal_attempt_fences(fixture.conn, limit=16) == [
+    assert _external_reap(
+        fixture.board_path, limit=16, forced_state="dead",
+    ) == [
         ("run", old_run_id)
     ]
     assert process_tuple(kb.get_task(fixture.conn, fixture.task_id)) == before_task
@@ -464,7 +621,9 @@ def test_dead_fenced_retry_is_materialized_once_after_atomic_reap(
     assert task.worker_fence == fixture.raw_fence
     monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: "dead")
 
-    assert kb.reap_terminal_attempt_fences(fixture.conn, limit=16) == [
+    assert _external_reap(
+        fixture.board_path, limit=16, forced_state="dead",
+    ) == [
         ("task", fixture.task_id)
     ]
     task = kb.get_task(fixture.conn, fixture.task_id)
@@ -478,7 +637,9 @@ def test_dead_fenced_retry_is_materialized_once_after_atomic_reap(
         None,
         None,
     )
-    assert kb.reap_terminal_attempt_fences(fixture.conn, limit=16) == []
+    assert _external_reap(
+        fixture.board_path, limit=16, forced_state="dead",
+    ) == []
 
 
 @darwin_only
@@ -496,16 +657,9 @@ def test_reaper_exact_cas_rolls_back_task_clear_when_run_changed(
     )
     before_task = process_tuple(kb.get_task(fixture.conn, fixture.task_id))
 
-    def race_run_identity(_fence):
-        fixture.conn.execute(
-            "UPDATE task_runs SET worker_identity='raced:identity' WHERE id=?",
-            (run_id,),
-        )
-        fixture.conn.commit()
-        return "dead"
-
-    monkeypatch.setattr(kb, "_fenced_group_state", race_run_identity)
-    assert kb.reap_terminal_attempt_fences(fixture.conn, limit=16) == []
+    assert _external_reap_with_run_identity_race(
+        fixture.board_path, run_id,
+    ) == []
     assert process_tuple(kb.get_task(fixture.conn, fixture.task_id)) == before_task
     run = fixture.conn.execute(
         "SELECT worker_identity, worker_fence FROM task_runs WHERE id=?",
@@ -516,10 +670,9 @@ def test_reaper_exact_cas_rolls_back_task_clear_when_run_changed(
 
 
 @darwin_only
-def test_reaper_honors_requested_bound(registered_current_process, monkeypatch):
-    fixture = registered_current_process
-    identity = kb._darwin_process_identity(os.getpgid(0))
-    assert identity is not None
+def test_reaper_honors_requested_bound(registered_other_group, monkeypatch):
+    fixture = registered_other_group
+    identity = fixture.identity
     other_id, _claimed, _raw = create_bound_attempt(
         fixture.conn,
         leader_identity=identity,
@@ -561,11 +714,10 @@ def test_init_db_migrates_durable_terminal_reaper_cursor(isolated_home):
 
 @darwin_only
 def test_reaper_durable_cursor_survives_one_shot_restart_and_reaches_orphan(
-    registered_current_process,
+    registered_other_group,
 ):
-    fixture = registered_current_process
-    identity = kb._darwin_process_identity(os.getpgid(0))
-    assert identity is not None
+    fixture = registered_other_group
+    identity = fixture.identity
     attempts = [
         (fixture.task_id, fixture.claimed, fixture.raw_fence),
         create_bound_attempt(fixture.conn, leader_identity=identity),
@@ -649,6 +801,7 @@ with kb.connect_closing(Path(sys.argv[1])) as conn:
         completed = subprocess.run(
             [sys.executable, "-c", one_shot, str(fixture.board_path)],
             check=True,
+            start_new_session=True,
             capture_output=True,
             text=True,
         )
@@ -670,12 +823,11 @@ with kb.connect_closing(Path(sys.argv[1])) as conn:
 
 @darwin_only
 def test_reaper_cursor_reservation_serializes_independent_connections(
-    registered_current_process,
+    registered_other_group,
     monkeypatch,
 ):
-    fixture = registered_current_process
-    identity = kb._darwin_process_identity(os.getpgid(0))
-    assert identity is not None
+    fixture = registered_other_group
+    identity = fixture.identity
     attempts = [(fixture.task_id, fixture.claimed, fixture.raw_fence)]
     attempts.extend(
         create_bound_attempt(fixture.conn, leader_identity=identity)
@@ -722,12 +874,11 @@ def test_reaper_cursor_reservation_serializes_independent_connections(
 
 @darwin_only
 def test_reaper_cursor_write_failure_rolls_back_before_probe_or_mutation(
-    registered_current_process,
+    registered_other_group,
     monkeypatch,
 ):
-    fixture = registered_current_process
-    identity = kb._darwin_process_identity(os.getpgid(0))
-    assert identity is not None
+    fixture = registered_other_group
+    identity = fixture.identity
     other_id, other_claimed, other_raw = create_bound_attempt(
         fixture.conn,
         leader_identity=identity,
@@ -815,7 +966,7 @@ def test_request_review_stays_hidden_until_fenced_group_is_dead(
     assert json.loads(run["metadata"])["retry_status"] == "review"
 
     monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: "dead")
-    assert kb.reap_terminal_attempt_fences(fixture.conn) == [
+    assert _external_reap(fixture.board_path, forced_state="dead") == [
         ("task", fixture.task_id)
     ]
     assert kb.get_task(fixture.conn, fixture.task_id).status == "review"
@@ -870,7 +1021,7 @@ def test_request_changes_stays_hidden_until_fenced_group_is_dead(
     assert json.loads(run["metadata"])["retry_status"] == "ready"
 
     monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: "dead")
-    assert kb.reap_terminal_attempt_fences(fixture.conn) == [
+    assert _external_reap(fixture.board_path, forced_state="dead") == [
         ("task", fixture.task_id)
     ]
     task = kb.get_task(fixture.conn, fixture.task_id)
@@ -940,7 +1091,7 @@ def test_registration_discovery_rejects_multiple_rows(
     fixture = registered_current_process
     identity = kb._darwin_process_identity(os.getpgid(0))
     assert identity is not None
-    create_bound_attempt(fixture.conn, leader_identity=identity)
+    _bind_second_attempt_from_external_dispatcher(fixture, identity)
     with pytest.raises(kb.StaleAttemptError):
         kb._discover_current_worker_registration()
 
@@ -1210,16 +1361,15 @@ def test_registration_discovery_rejects_cross_task_run_with_zero_delta(
     fixture = registered_current_process
     identity = kb._darwin_process_identity(os.getpgid(0))
     assert identity is not None
-    other_task_id, other_claimed, other_fence = create_bound_attempt(
-        fixture.conn,
-        leader_identity=identity,
+    other_task_id, other_claimed, other_fence = (
+        _bind_second_attempt_from_external_dispatcher(fixture, identity)
     )
     fixture.conn.execute(
         "UPDATE tasks SET current_run_id=?, claim_lock=?, worker_pid=?, "
         "worker_pgid=?, worker_identity=?, worker_fence=? WHERE id=?",
         (
-            other_claimed.current_run_id,
-            other_claimed.claim_lock,
+            other_claimed["run_id"],
+            other_claimed["claim_lock"],
             identity.pid,
             identity.pgid,
             identity.token,
