@@ -204,18 +204,69 @@ def finalize_turn(
         # consecutive-failure circuit breaker (#29747 gap 2).
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
-            _record_kanban_budget_exhausted(
-                _kanban_task, api_call_count, agent.max_iterations, logger,
-            )
+            try:
+                from hermes_cli import kanban_db as _kb
+                from hermes_cli.config import load_config as _load_config
+
+                raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+                claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+                if not raw_run_id or not claim_lock:
+                    raise _kb.StaleAttemptError(
+                        "kanban finalizer lacks exact attempt ownership"
+                    )
+                expected_run_id = int(raw_run_id)
+                try:
+                    raw_limit = (_load_config().get("kanban") or {}).get(
+                        "failure_limit", _kb.DEFAULT_FAILURE_LIMIT
+                    )
+                    failure_limit = int(raw_limit)
+                    if failure_limit < 1:
+                        raise ValueError
+                except (AttributeError, TypeError, ValueError):
+                    failure_limit = _kb.DEFAULT_FAILURE_LIMIT
+                _conn = _kb.connect()
+                try:
+                    _kb._record_task_failure(
+                        _conn,
+                        _kanban_task,
+                        error=(
+                            f"Iteration budget exhausted "
+                            f"({api_call_count}/{agent.max_iterations}) — "
+                            "task could not complete within the allowed "
+                            "iterations"
+                        ),
+                        outcome="timed_out",
+                        failure_limit=failure_limit,
+                        release_claim=True,
+                        end_run=True,
+                        event_payload_extra={
+                            "budget_used": api_call_count,
+                            "budget_max": agent.max_iterations,
+                        },
+                        expected_run_id=expected_run_id,
+                        expected_claim_lock=claim_lock,
+                    )
+                    logger.info(
+                        "recorded budget-exhausted failure for task %s (%d/%d)",
+                        _kanban_task, api_call_count, agent.max_iterations,
+                    )
+                finally:
+                    try:
+                        _conn.close()
+                    except Exception:
+                        pass
+            except Exception:
+                logger.warning(
+                    "Failed to record budget-exhausted failure for task %s",
+                    _kanban_task,
+                    exc_info=True,
+                )
     elif budget_exhausted:
         # Bounded fallback (#87096): budget was exhausted but none of the
         # normal fallback paths were eligible (interrupted / failed /
         # anomalous exit_reason). If running as a kanban worker we must
         # still record a terminal outcome so the task does not remain in
-        # an ambiguous lifecycle state. The worker's run is closed via
-        # ``_record_task_failure`` (compare-and-swap receipt path) which
-        # is a no-op if another path closed it — the CAS invariant in
-        # ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
+        # an ambiguous lifecycle state.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             _record_kanban_budget_exhausted(
