@@ -257,6 +257,32 @@ def test_abort_escalates_until_entire_verified_group_is_dead(tmp_path):
         pending.proc.wait(timeout=5)
 
 
+def test_abort_never_signals_reused_group_after_reaped_leader(
+    tmp_path,
+    monkeypatch,
+):
+    pending = kb._spawn_behind_bootstrap(
+        ["/usr/bin/true"],
+        env=os.environ,
+        cwd=str(tmp_path),
+        stdout=subprocess.DEVNULL,
+    )
+    pending.release()
+    assert pending.proc.wait(timeout=5) == 0
+    signals = []
+    monkeypatch.setattr(kb, "_identity_matches", lambda _identity: False)
+    monkeypatch.setattr(
+        pending,
+        "_group_has_live_members",
+        lambda: True,
+    )
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: signals.append((pgid, sig)))
+
+    with pytest.raises(kb.UnknownWorkerProcess, match="reused process identity"):
+        pending.abort()
+    assert signals == []
+
+
 def test_spawn_start_failure_lost_claim_is_zero_delta(isolated_home):
     conn = kb.connect()
     try:

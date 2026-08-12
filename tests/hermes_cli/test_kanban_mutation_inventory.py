@@ -30,6 +30,7 @@ CLASSIFIED_INTERNAL_EFFECTS = frozenset(
         "_reclaim_dangling_run",
         "_bind_pending_worker",
         "_record_and_abort_failed_bind",
+        "_record_post_bind_release_failure",
         "_defer_reclaim_for_live_worker",
         "_set_worker_pid",
         "_clear_failure_counter",
@@ -101,7 +102,24 @@ CLASSIFIED_EXTERNAL_INTERNAL_EFFECT_EDGES = frozenset(
     }
 )
 
-CLASSIFIED_BOOTSTRAP_PROCESS_EFFECTS = frozenset({"main"})
+CLASSIFIED_PROCESS_FD_EFFECTS = frozenset({
+    "hermes_cli/kanban_db.py:PendingWorkerProcess._close_gate",
+    "hermes_cli/kanban_db.py:PendingWorkerProcess._group_has_live_members",
+    "hermes_cli/kanban_db.py:PendingWorkerProcess.abort",
+    "hermes_cli/kanban_db.py:PendingWorkerProcess.release",
+    "hermes_cli/kanban_db.py:_cleanup_worker_tmux",
+    "hermes_cli/kanban_db.py:_ensure_git_worktree",
+    "hermes_cli/kanban_db.py:_fenced_group_state",
+    "hermes_cli/kanban_db.py:_git_branch_exists",
+    "hermes_cli/kanban_db.py:_git_common_dir",
+    "hermes_cli/kanban_db.py:_git_current_branch",
+    "hermes_cli/kanban_db.py:_git_dir",
+    "hermes_cli/kanban_db.py:_git_toplevel",
+    "hermes_cli/kanban_db.py:_pid_alive",
+    "hermes_cli/kanban_db.py:_spawn_behind_bootstrap",
+    "hermes_cli/kanban_db.py:reap_worker_zombies",
+    "hermes_cli/process_bootstrap.py:main",
+})
 
 TRANSACTIONAL_CONTROL_PLANE_SURFACES = frozenset(
     {
@@ -240,14 +258,37 @@ def _derived_bootstrap_process_effects(source: str) -> set[str]:
     """Return class-qualified functions that own OS process/FD effects."""
     module = ast.parse(source)
     process_calls = {
+        "os.fork",
+        "os.forkpty",
+        "os.posix_spawn",
+        "os.posix_spawnp",
+        "os.open",
+        "os.pipe",
+        "os.pipe2",
+        "os.dup",
+        "os.dup2",
+        "os.fdopen",
+        "os.read",
         "os.write",
         "os.close",
+        "os.execl",
+        "os.execle",
+        "os.execlp",
+        "os.execlpe",
         "os.execv",
         "os.execve",
+        "os.execvp",
+        "os.execvpe",
         "os.kill",
         "os.killpg",
+        "os.wait",
+        "os.waitid",
         "os.waitpid",
         "subprocess.Popen",
+        "subprocess.run",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
     }
 
     def dotted_name(node):
@@ -264,7 +305,24 @@ def _derived_bootstrap_process_effects(source: str) -> set[str]:
     def visit_function(node, prefix=""):
         if any(
             isinstance(child, ast.Call)
-            and dotted_name(child.func) in process_calls
+            and (
+                dotted_name(child.func) in process_calls
+                or (
+                    isinstance(child.func, ast.Attribute)
+                    and child.func.attr in {
+                        "communicate",
+                        "kill",
+                        "poll",
+                        "send_signal",
+                        "terminate",
+                        "wait",
+                    }
+                    and any(
+                        part in (ast.get_source_segment(source, child.func.value) or "")
+                        for part in ("proc", "process")
+                    )
+                )
+            )
             for child in ast.walk(node)
         ):
             discovered.add(f"{prefix}{node.name}")
@@ -329,12 +387,23 @@ def test_derived_mutation_inventory_has_no_unknown_surface():
         assert calls & gate_calls, f"ungated Hermes mutation surface: {name}"
 
 
-def test_bootstrap_process_inventory_is_qualified_and_exhaustive():
+def test_process_fd_inventory_is_qualified_and_exhaustive():
     bootstrap_path = Path(kb.__file__).with_name("process_bootstrap.py")
-    discovered = _derived_bootstrap_process_effects(
-        bootstrap_path.read_text(encoding="utf-8")
-    )
-    assert discovered == set(CLASSIFIED_BOOTSTRAP_PROCESS_EFFECTS)
+    sources = {
+        "hermes_cli/kanban_db.py": Path(kb.__file__).read_text(encoding="utf-8"),
+        "hermes_cli/process_bootstrap.py": bootstrap_path.read_text(encoding="utf-8"),
+    }
+    discovered = {
+        f"{path}:{name}"
+        for path, source in sources.items()
+        for name in _derived_bootstrap_process_effects(source)
+    }
+    assert "hermes_cli/kanban_db.py:PendingWorkerProcess._close_gate" in discovered
+    assert "hermes_cli/kanban_db.py:PendingWorkerProcess.release" in discovered
+    assert "hermes_cli/kanban_db.py:PendingWorkerProcess.abort" in discovered
+    assert "hermes_cli/kanban_db.py:_spawn_behind_bootstrap" in discovered
+    assert "hermes_cli/process_bootstrap.py:main" in discovered
+    assert discovered == set(CLASSIFIED_PROCESS_FD_EFFECTS)
 
     sample = """
 import os

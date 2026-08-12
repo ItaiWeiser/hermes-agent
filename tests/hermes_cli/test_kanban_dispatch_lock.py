@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 
 from pathlib import Path
 
@@ -245,3 +246,134 @@ def test_review_dispatch_uses_same_bind_before_release_contract(
         pending = holder.get("pending")
         if pending is not None:
             pending.abort()
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+def test_post_bind_release_failure_terminalizes_exact_attempt_then_reaps(
+    conn,
+    tmp_path,
+    monkeypatch,
+    lane,
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    task_id = kb.create_task(conn, title=f"{lane} release failure", assignee="w")
+    if lane == "review":
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+        conn.commit()
+    holder = {}
+
+    def pending_spawn(task, workspace_path, board=None):
+        pending = kb._spawn_behind_bootstrap(
+            ["/bin/sleep", "60"],
+            env=os.environ,
+            cwd=str(tmp_path),
+            stdout=subprocess.DEVNULL,
+        )
+        holder["pending"] = pending
+
+        def fail_release():
+            raise OSError("release failed after bind")
+
+        pending.release = fail_release
+        return pending
+
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=pending_spawn,
+        reconcile_orphans=False,
+    )
+    assert result.spawned == []
+    pending = holder["pending"]
+    assert pending.proc.poll() is not None
+    task = kb.get_task(conn, task_id)
+    run = kb.get_run(conn, task.current_run_id)
+    assert task.status == lane
+    assert run.ended_at is not None
+    assert run.outcome == "spawn_failed"
+    assert task.worker_fence == run.worker_fence
+    assert task.worker_pid == run.worker_pid == pending.identity.pid
+    assert task.worker_pgid == run.worker_pgid == pending.identity.pgid
+    assert task.worker_identity == run.worker_identity == pending.identity.token
+
+    assert kb.reap_terminal_attempt_fences(conn, limit=16) == [("task", task_id)]
+    task = kb.get_task(conn, task_id)
+    run = kb.get_run(conn, run.id)
+    assert task.status == lane
+    assert task.worker_fence is None and run.worker_fence is None
+    assert task.claim_lock is None and run.claim_lock is None
+
+
+def test_post_bind_release_failure_lost_claim_is_zero_delta(
+    conn,
+    tmp_path,
+    monkeypatch,
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    task_id = kb.create_task(conn, title="release ownership lost", assignee="w")
+    holder = {}
+
+    def snapshot():
+        return (
+            tuple(tuple(row) for row in conn.execute("SELECT * FROM tasks")),
+            tuple(tuple(row) for row in conn.execute("SELECT * FROM task_runs")),
+            tuple(tuple(row) for row in conn.execute("SELECT * FROM task_events")),
+        )
+
+    def pending_spawn(task, workspace_path, board=None):
+        pending = kb._spawn_behind_bootstrap(
+            ["/bin/sleep", "60"],
+            env=os.environ,
+            cwd=str(tmp_path),
+            stdout=subprocess.DEVNULL,
+        )
+        holder["pending"] = pending
+
+        def fail_release_after_owner_change():
+            pending.abort()
+            conn.execute(
+                "UPDATE tasks SET claim_lock='fixture:new-owner' WHERE id=?",
+                (task.id,),
+            )
+            conn.commit()
+            holder["before"] = snapshot()
+            raise OSError("release failed after ownership loss")
+
+        pending.release = fail_release_after_owner_change
+        return pending
+
+    with pytest.raises(kb.SpawnBindError, match="lost exact attempt ownership"):
+        kb.dispatch_once(
+            conn,
+            spawn_fn=pending_spawn,
+            reconcile_orphans=False,
+        )
+    assert snapshot() == holder["before"]
+    assert holder["pending"].proc.poll() is not None
+
+
+@pytest.mark.parametrize("fatal", [kb.UnknownWorkerProcess, kb.SpawnBindError])
+def test_run_daemon_stops_after_unrecoverable_dispatch_failure(
+    kanban_home,
+    monkeypatch,
+    fatal,
+):
+    calls = []
+    stop = threading.Event()
+
+    def fail_once(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise fatal("fatal fence state")
+        stop.set()
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kb, "dispatch_once", fail_once)
+    monkeypatch.setattr(kb, "connect", lambda: kb.sqlite3.connect(":memory:"))
+    with pytest.raises(fatal, match="fatal fence state"):
+        kb.run_daemon(interval=0, stop_event=stop)
+    assert calls == [1]
