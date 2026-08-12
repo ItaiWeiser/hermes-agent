@@ -57,6 +57,21 @@ def conn(kanban_home):
         yield c
 
 
+@pytest.fixture
+def worker_identity():
+    leader = subprocess.Popen(["sleep", "60"], process_group=0)
+    identity = kb._darwin_process_identity(leader.pid)
+    assert identity is not None
+    try:
+        yield identity
+    finally:
+        try:
+            os.killpg(identity.pgid, 9)
+        except ProcessLookupError:
+            pass
+        leader.wait(timeout=5)
+
+
 def test_stale_crash_reset_rejected_for_reclaimed_task(conn):
     """A reset carrying an OLD worker's claim_lock must NOT clobber a task
     that has since been re-claimed by a new worker."""
@@ -133,12 +148,11 @@ def test_stale_fenced_claim_is_never_mutated_without_proven_death(
     conn,
     monkeypatch,
     group_state,
+    worker_identity,
 ):
-    identity = kb._darwin_process_identity(os.getpgid(0))
-    assert identity is not None
     task_id, _claimed, _raw = create_bound_attempt(
         conn,
-        leader_identity=identity,
+        leader_identity=worker_identity,
     )
     conn.execute(
         "UPDATE tasks SET claim_expires=0 WHERE id=?",
@@ -162,12 +176,11 @@ def test_manual_fenced_reclaim_requires_death_and_reason(
     monkeypatch,
     group_state,
     reason,
+    worker_identity,
 ):
-    identity = kb._darwin_process_identity(os.getpgid(0))
-    assert identity is not None
     task_id, _claimed, _raw = create_bound_attempt(
         conn,
-        leader_identity=identity,
+        leader_identity=worker_identity,
     )
     before = logical_board_snapshot(conn)
     monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: group_state)
@@ -177,12 +190,12 @@ def test_manual_fenced_reclaim_requires_death_and_reason(
 
 
 @darwin_only
-def test_fenced_reassign_reclaim_requires_explicit_reason(conn, monkeypatch):
-    identity = kb._darwin_process_identity(os.getpgid(0))
-    assert identity is not None
+def test_fenced_reassign_reclaim_requires_explicit_reason(
+    conn, monkeypatch, worker_identity,
+):
     task_id, _claimed, _raw = create_bound_attempt(
         conn,
-        leader_identity=identity,
+        leader_identity=worker_identity,
     )
     before = logical_board_snapshot(conn)
     monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: "dead")
@@ -200,12 +213,11 @@ def test_fenced_reassign_reclaim_requires_explicit_reason(conn, monkeypatch):
 def test_manual_fenced_reclaim_clears_only_proven_dead_exact_owner(
     conn,
     monkeypatch,
+    worker_identity,
 ):
-    identity = kb._darwin_process_identity(os.getpgid(0))
-    assert identity is not None
     task_id, claimed, _raw = create_bound_attempt(
         conn,
-        leader_identity=identity,
+        leader_identity=worker_identity,
     )
     monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: "dead")
 
@@ -231,19 +243,21 @@ def test_manual_fenced_reclaim_clears_only_proven_dead_exact_owner(
 def test_manual_reclaim_cannot_reopen_a_terminal_fenced_outcome(
     conn,
     monkeypatch,
+    worker_identity,
 ):
-    identity = kb._darwin_process_identity(os.getpgid(0))
-    assert identity is not None
     task_id, claimed, _raw = create_bound_attempt(
         conn,
-        leader_identity=identity,
+        leader_identity=worker_identity,
     )
-    assert kb.complete_task(
-        conn,
-        task_id,
-        result="finished",
-        expected_run_id=claimed.current_run_id,
+    conn.execute(
+        "UPDATE tasks SET status='done', result='finished' WHERE id=?",
+        (task_id,),
     )
+    conn.execute(
+        "UPDATE task_runs SET status='done', outcome='completed' WHERE id=?",
+        (claimed.current_run_id,),
+    )
+    conn.commit()
     before = logical_board_snapshot(conn)
     monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: "dead")
 
@@ -262,12 +276,11 @@ def test_legacy_recovery_paths_never_mutate_a_fenced_attempt(
     conn,
     monkeypatch,
     recovery,
+    worker_identity,
 ):
-    identity = kb._darwin_process_identity(os.getpgid(0))
-    assert identity is not None
     task_id, claimed, raw = create_bound_attempt(
         conn,
-        leader_identity=identity,
+        leader_identity=worker_identity,
     )
     host_lock = f"{kb._claimer_id().split(':', 1)[0]}:legacy-recovery"
     fence = json.loads(raw)
