@@ -28,6 +28,8 @@ CLASSIFIED_INTERNAL_EFFECTS = frozenset(
         "_insert_completion_attachment",
         "_reclaim_proven_dead_fenced_attempt",
         "_reclaim_dangling_run",
+        "_bind_pending_worker",
+        "_record_and_abort_failed_bind",
         "_defer_reclaim_for_live_worker",
         "_set_worker_pid",
         "_clear_failure_counter",
@@ -43,6 +45,7 @@ CLASSIFIED_INTERNAL_EFFECTS = frozenset(
         "_rotate_worker_log",
         "_cleanup_worker_tmux",
         "_default_spawn",
+        "_spawn_behind_bootstrap",
         "_dispatch_once_locked",
         "_control_plane_write_txn",
         "_authorized_write_txn",
@@ -98,7 +101,7 @@ CLASSIFIED_EXTERNAL_INTERNAL_EFFECT_EDGES = frozenset(
     }
 )
 
-CLASSIFIED_BOOTSTRAP_PROCESS_EFFECTS = frozenset()
+CLASSIFIED_BOOTSTRAP_PROCESS_EFFECTS = frozenset({"main"})
 
 TRANSACTIONAL_CONTROL_PLANE_SURFACES = frozenset(
     {

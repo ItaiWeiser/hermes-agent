@@ -88,7 +88,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Literal, Mapping, Optional
+from typing import Any, Iterable, Literal, Mapping, Optional, Sequence
 
 from hermes_cli.process_bootstrap import (
     AttemptFenceCapabilityError,
@@ -114,6 +114,183 @@ _log = logging.getLogger(__name__)
 def _identity_matches(expected: DarwinProcessIdentity) -> bool:
     """Return whether ``expected`` still names the same live process."""
     return _darwin_process_identity(expected.pid) == expected
+
+
+class SpawnStartError(RuntimeError):
+    """The blocked bootstrap process could not be started safely."""
+
+
+class UnknownWorkerProcess(RuntimeError):
+    """A pending worker could not be terminated with verified identity."""
+
+
+class UnfencedSpawnContractError(RuntimeError):
+    """A custom spawner returned a legacy result without a process fence."""
+
+
+class SpawnBindError(RuntimeError):
+    """A blocked worker could not be durably associated with its old run."""
+
+
+@dataclass
+class PendingWorkerProcess:
+    """A newly-started worker blocked before exec until its DB bind commits."""
+
+    proc: subprocess.Popen
+    gate_write_fd: int
+    identity: DarwinProcessIdentity
+
+    def _close_gate(self) -> None:
+        fd, self.gate_write_fd = self.gate_write_fd, -1
+        if fd >= 0:
+            os.close(fd)
+
+    def release(self) -> None:
+        try:
+            os.write(self.gate_write_fd, b"1")
+        except BaseException:
+            self.abort()
+            raise
+        finally:
+            self._close_gate()
+
+    def _group_has_live_members(self) -> Optional[bool]:
+        """Return live-member state; zombies are already dead processes."""
+        try:
+            os.killpg(self.identity.pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return None
+        try:
+            inspected = subprocess.run(
+                ["ps", "-axo", "pgid=,stat="],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=1,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            return None
+        if inspected.returncode != 0:
+            return None
+        states = []
+        for line in inspected.stdout.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[0] == str(self.identity.pgid):
+                states.append(fields[1])
+        if not states:
+            return False
+        return any("Z" not in state for state in states)
+
+    def abort(self) -> None:
+        self._close_gate()
+        import signal
+
+        leader_is_current = _identity_matches(self.identity)
+        leader_was_reaped = self.proc.poll() is not None
+        if leader_was_reaped:
+            self.proc.wait()
+        elif leader_is_current:
+            try:
+                os.killpg(self.identity.pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                self.proc.wait(timeout=5)
+                leader_was_reaped = True
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired as exc:
+                raise UnknownWorkerProcess(
+                    "cannot safely kill reused process identity"
+                ) from exc
+
+        group_live = self._group_has_live_members()
+        if group_live is False:
+            return
+        if group_live is None:
+            raise UnknownWorkerProcess(
+                "cannot prove pending worker group termination"
+            )
+        if leader_is_current or leader_was_reaped:
+            try:
+                os.killpg(self.identity.pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                group_live = self._group_has_live_members()
+                if group_live is False:
+                    return
+                if group_live is None:
+                    raise UnknownWorkerProcess(
+                        "cannot prove pending worker group termination"
+                    )
+                time.sleep(0.02)
+            raise UnknownWorkerProcess(
+                "verified pending worker group survived SIGKILL"
+            )
+        else:
+            if not _identity_matches(self.identity):
+                raise UnknownWorkerProcess(
+                    "cannot safely kill reused process identity"
+                )
+
+
+def _spawn_behind_bootstrap(
+    command: Sequence[str],
+    *,
+    env: Mapping[str, str],
+    cwd: Optional[str],
+    stdout: Any,
+    python_executable: Optional[str] = None,
+) -> PendingWorkerProcess:
+    """Start an isolated bootstrap that cannot exec ``command`` before release."""
+    _require_attempt_fence_platform()
+    read_fd, write_fd = os.pipe()
+    try:
+        proc = subprocess.Popen(  # noqa: S603 - dispatcher-owned argv
+            [
+                python_executable or sys.executable,
+                "-m",
+                "hermes_cli.process_bootstrap",
+                "--gate-fd",
+                str(read_fd),
+                "--",
+                *command,
+            ],
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=subprocess.STDOUT,
+            env=dict(env),
+            pass_fds=(read_fd,),
+            start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+        )
+    except BaseException as exc:
+        os.close(read_fd)
+        os.close(write_fd)
+        raise SpawnStartError("worker bootstrap could not start") from exc
+    os.close(read_fd)
+    identity = _darwin_process_identity(proc.pid)
+    if identity is None or identity.pgid != proc.pid:
+        os.close(write_fd)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            raise UnknownWorkerProcess(
+                "bootstrap identity unavailable and process did not exit"
+            ) from exc
+        raise SpawnStartError("worker bootstrap identity is unavailable")
+    return PendingWorkerProcess(proc, write_fd, identity)
 
 
 # ---------------------------------------------------------------------------
@@ -5105,10 +5282,11 @@ _TERMINAL_FENCE_CANDIDATES_SQL = """
                r.id AS run_id, r.worker_pid, r.worker_pgid,
                r.worker_identity, r.worker_fence, r.outcome, r.metadata,
                '1:run:' || printf('%020d', r.id) AS sort_key
-          FROM task_runs r
+         FROM task_runs r
           LEFT JOIN tasks t ON t.id = r.task_id
          WHERE r.worker_fence IS NOT NULL
-           AND (t.current_run_id IS NULL OR t.current_run_id <> r.id)
+           AND (t.current_run_id IS NULL OR t.current_run_id <> r.id
+                OR t.claim_lock IS NOT r.claim_lock)
            AND CASE WHEN json_valid(r.worker_fence)
                     THEN json_extract(r.worker_fence, '$.reason')
                     ELSE NULL END = 'spawn_bind_failed'
@@ -10366,6 +10544,8 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -10415,11 +10595,25 @@ def _record_task_failure(
     blocked = False
     with _authorized_write_txn(conn, (task_id,)):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, "
+            "claim_lock "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
+        if expected_run_id is not None and (
+            row["current_run_id"] != expected_run_id
+            or row["claim_lock"] != expected_claim_lock
+        ):
+            return False
+        if expected_run_id is not None:
+            run_owner = conn.execute(
+                "SELECT 1 FROM task_runs WHERE id=? AND task_id=? "
+                "AND status='running' AND claim_lock=? AND ended_at IS NULL",
+                (expected_run_id, task_id, expected_claim_lock),
+            ).fetchone()
+            if run_owner is None:
+                return False
         retry_status = (
             _retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
@@ -10558,6 +10752,266 @@ def _record_spawn_failure(
         release_claim=True,
         end_run=True,
     )
+
+
+def _handle_spawn_start_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    error: str,
+    run_id: int,
+    claim_lock: str,
+    failure_limit: int = None,
+) -> bool:
+    """Record a pre-process spawn failure through the bounded retry path."""
+    return _record_task_failure(
+        conn,
+        task_id,
+        error,
+        outcome="spawn_failed",
+        failure_limit=failure_limit,
+        release_claim=True,
+        end_run=True,
+        expected_run_id=run_id,
+        expected_claim_lock=claim_lock,
+    )
+
+
+def _worker_fence_for_pending(
+    pending: PendingWorkerProcess,
+    *,
+    run_id: int,
+    claim_lock: str,
+    reason: str,
+) -> str:
+    host = _host_id()
+    if host is None:
+        raise AttemptFenceCapabilityError("worker host identity is unavailable")
+    return json.dumps(
+        {
+            "run_id": run_id,
+            "claim_lock": claim_lock,
+            "host": host,
+            "leader_pid": pending.identity.pid,
+            "worker_pgid": pending.identity.pgid,
+            "worker_identity": pending.identity.token,
+            "reason": reason,
+            "created_at": int(time.time()),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _bind_pending_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pending: PendingWorkerProcess,
+    *,
+    run_id: int,
+    claim_lock: str,
+) -> bool:
+    """Atomically bind a blocked process to the exact claimed task and run."""
+    if not _identity_matches(pending.identity):
+        return False
+    raw_fence = _worker_fence_for_pending(
+        pending,
+        run_id=run_id,
+        claim_lock=claim_lock,
+        reason="running",
+    )
+    try:
+        with _control_plane_write_txn(conn):
+            task_cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET worker_pid=?, worker_pgid=?, worker_identity=?, worker_fence=?
+                 WHERE id=? AND status='running' AND current_run_id=?
+                   AND claim_lock=? AND worker_fence IS NULL
+                """,
+                (
+                    pending.identity.pid,
+                    pending.identity.pgid,
+                    pending.identity.token,
+                    raw_fence,
+                    task_id,
+                    run_id,
+                    claim_lock,
+                ),
+            )
+            if task_cur.rowcount != 1:
+                raise _FenceReapCasLost
+            run_cur = conn.execute(
+                """
+                UPDATE task_runs
+                   SET worker_pid=?, worker_pgid=?, worker_identity=?, worker_fence=?
+                 WHERE id=? AND task_id=? AND status='running'
+                   AND claim_lock=? AND worker_fence IS NULL AND ended_at IS NULL
+                """,
+                (
+                    pending.identity.pid,
+                    pending.identity.pgid,
+                    pending.identity.token,
+                    raw_fence,
+                    run_id,
+                    task_id,
+                    claim_lock,
+                ),
+            )
+            if run_cur.rowcount != 1:
+                raise _FenceReapCasLost
+            _append_event(
+                conn,
+                task_id,
+                "spawned",
+                {"pid": pending.identity.pid},
+                run_id=run_id,
+            )
+    except _FenceReapCasLost:
+        return False
+    return True
+
+
+def _record_and_abort_failed_bind(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pending: PendingWorkerProcess,
+    *,
+    run_id: int,
+    claim_lock: str,
+) -> str:
+    """Fence only the losing run, then synchronously terminate its process."""
+    recorded = False
+    try:
+        raw_fence = _worker_fence_for_pending(
+            pending,
+            run_id=run_id,
+            claim_lock=claim_lock,
+            reason="spawn_bind_failed",
+        )
+        with _control_plane_write_txn(conn):
+            cur = conn.execute(
+                """
+                UPDATE task_runs
+                   SET worker_pid=?, worker_pgid=?, worker_identity=?, worker_fence=?
+                 WHERE id=? AND task_id=? AND status='running'
+                   AND claim_lock=? AND worker_fence IS NULL AND ended_at IS NULL
+                """,
+                (
+                    pending.identity.pid,
+                    pending.identity.pgid,
+                    pending.identity.token,
+                    raw_fence,
+                    run_id,
+                    task_id,
+                    claim_lock,
+                ),
+            )
+            recorded = cur.rowcount == 1
+    finally:
+        pending.abort()
+    if not recorded:
+        raise SpawnBindError("failed bind could not fence the losing run")
+    return raw_fence
+
+
+def _invoke_worker_spawn(
+    spawn_fn: Any,
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str],
+) -> Any:
+    """Invoke a worker spawner while retaining the legacy two-arg signature."""
+    import inspect
+
+    try:
+        sig = inspect.signature(spawn_fn)
+        if "board" in sig.parameters:
+            return spawn_fn(task, workspace, board=board)
+    except (TypeError, ValueError):
+        pass
+    return spawn_fn(task, workspace)
+
+
+def _spawn_bind_and_release(
+    conn: sqlite3.Connection,
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str],
+    spawn_fn: Any,
+    failure_limit: int,
+) -> tuple[bool, bool]:
+    """Start a claimed worker, bind it atomically, then release its gate.
+
+    Returns ``(spawned, auto_blocked)``.  A ``None`` result remains the
+    compatibility seam for test/no-process spawners; every real process must
+    be represented by ``PendingWorkerProcess`` so it cannot execute unfenced.
+    """
+    if task.current_run_id is None or not task.claim_lock:
+        raise SpawnBindError("claimed task has no exact run/claim ownership")
+    pending: Optional[PendingWorkerProcess] = None
+    try:
+        candidate = _invoke_worker_spawn(
+            spawn_fn,
+            task,
+            workspace,
+            board=board,
+        )
+        if candidate is None:
+            _fire_worker_spawned_hook(
+                conn, task, workspace, None, board=board,
+            )
+            return True, False
+        if not isinstance(candidate, PendingWorkerProcess):
+            if type(candidate) is int:
+                detail = "legacy integer spawn result is unfenced"
+            else:
+                detail = "spawn result is not a pending worker process"
+            raise UnfencedSpawnContractError(detail)
+        pending = candidate
+        if not _bind_pending_worker(
+            conn,
+            task.id,
+            pending,
+            run_id=task.current_run_id,
+            claim_lock=task.claim_lock,
+        ):
+            _record_and_abort_failed_bind(
+                conn,
+                task.id,
+                pending,
+                run_id=task.current_run_id,
+                claim_lock=task.claim_lock,
+            )
+            pending = None
+            return False, False
+        pending.release()
+        _fire_worker_spawned_hook(
+            conn,
+            task,
+            workspace,
+            pending.identity.pid,
+            board=board,
+        )
+        pending = None
+        return True, False
+    except (UnknownWorkerProcess, SpawnBindError):
+        raise
+    except Exception as exc:
+        auto_blocked = _handle_spawn_start_failure(
+            conn,
+            task.id,
+            error=str(exc),
+            run_id=task.current_run_id,
+            claim_lock=task.claim_lock,
+            failure_limit=failure_limit,
+        )
+        return False, auto_blocked
+    finally:
+        if pending is not None:
+            pending.abort()
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
@@ -11137,9 +11591,9 @@ def _dispatch_once_locked(
       3. Reclaim crashed running tasks (host-local PID no longer alive).
       3. Promote todo -> ready where all parents are done.
       4. For each ready task with an assignee, atomically claim and call
-         ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
-         return value (if any) is recorded as ``worker_pid`` so subsequent
-         ticks can detect crashes before the TTL expires.
+         ``spawn_fn(task, workspace_path, board)``. Real process spawners
+         return a blocked ``PendingWorkerProcess``; the dispatcher binds its
+         exact process fence before releasing it to execute.
 
     Spawn failures are counted per-task. After ``failure_limit`` consecutive
     failures the task is auto-blocked with the last error as its reason —
@@ -11480,27 +11934,18 @@ def _dispatch_once_locked(
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
-            # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
-            # returned and the PID (when reported) is durably persisted,
-            # per the RFC timing contract. Best-effort — can never break
-            # the dispatch loop.
-            _fire_worker_spawned_hook(
-                conn, claimed, str(workspace), pid, board=board,
+            did_spawn, auto = _spawn_bind_and_release(
+                conn,
+                claimed,
+                str(workspace),
+                board=board,
+                spawn_fn=_spawn,
+                failure_limit=failure_limit,
             )
+            if not did_spawn:
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                continue
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -11517,6 +11962,8 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except (UnknownWorkerProcess, SpawnBindError):
+            raise
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -11615,28 +12062,26 @@ def _dispatch_once_locked(
         )
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
-            # Worker-lifecycle observer (RFC #58548): same contract as the
-            # ready-lane fire above — after spawn + PID persistence.
-            _fire_worker_spawned_hook(
-                conn, claimed, str(workspace), pid, board=board,
+            did_spawn, auto = _spawn_bind_and_release(
+                conn,
+                claimed,
+                str(workspace),
+                board=board,
+                spawn_fn=_spawn,
+                failure_limit=failure_limit,
             )
+            if not did_spawn:
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                continue
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
             if _per_profile_cap is not None and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except (UnknownWorkerProcess, SpawnBindError):
+            raise
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -11940,20 +12385,18 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
-) -> Optional[int]:
-    """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
+) -> Optional[PendingWorkerProcess]:
+    """Start ``hermes -p <profile> chat -q ...`` behind a release gate.
 
-    Returns the spawned child's PID so the dispatcher can detect crashes
-    before the claim TTL expires. The child's completion is still observed
-    via the ``complete`` / ``block`` transitions the worker writes itself;
-    the PID check is a safety net for crashes, OOM kills, and Ctrl+C.
+    The returned bootstrap is blocked before exec. The dispatcher durably
+    binds its PID, PGID, start identity, and raw attempt fence to the exact
+    task/run ownership before it releases that gate.
 
     ``board`` pins the child's kanban context to that board: the child's
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
     """
-    import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
@@ -12126,28 +12569,21 @@ def _default_spawn(
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
-        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+        return _spawn_behind_bootstrap(
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
             env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            cwd=workspace if os.path.isdir(workspace) else None,
+            stdout=log_f,
         )
-    except FileNotFoundError:
+    except SpawnStartError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            raise RuntimeError(
+                "`hermes` executable not found on PATH. "
+                "Install Hermes Agent or activate its venv before running the kanban dispatcher."
+            ) from exc
+        raise
+    finally:
         log_f.close()
-        raise RuntimeError(
-            "`hermes` executable not found on PATH. "
-            "Install Hermes Agent or activate its venv before running the kanban dispatcher."
-        )
-    # NOTE: we intentionally do NOT close log_f here — we want Popen's
-    # child process to keep writing after this function returns.  The
-    # handle is kept alive by the child's inheritance.  The parent's
-    # reference goes out of scope and is GC'd, but the OS-level FD stays
-    # open in the child until the child exits.
-    return proc.pid
 
 
 # ---------------------------------------------------------------------------
