@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import ctypes
 import json
 import os
@@ -11,6 +12,7 @@ import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 
 PROC_PIDTBSDINFO = 3
@@ -417,3 +419,24 @@ def _discover_current_worker_registration() -> ProcessProvenance | None:
         )
     path, row = matches[0]
     return _validated_provenance(path, row, caller_identity)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Wait for the dispatcher bind token, then replace this bootstrap."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gate-fd", type=int, required=True)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if not command:
+        return 64
+    token = os.read(args.gate_fd, 1)
+    os.close(args.gate_fd)
+    if token != b"1":
+        return 125
+    os.execvpe(command[0], command, os.environ)
+    return 127
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised through subprocess
+    raise SystemExit(main())
