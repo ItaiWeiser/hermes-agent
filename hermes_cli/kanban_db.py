@@ -191,8 +191,7 @@ class PendingWorkerProcess:
         import signal
 
         leader_is_current = _identity_matches(self.identity)
-        leader_was_reaped = self.proc.poll() is not None
-        if leader_was_reaped:
+        if self.proc.poll() is not None:
             self.proc.wait()
         elif leader_is_current:
             try:
@@ -201,7 +200,6 @@ class PendingWorkerProcess:
                 pass
             try:
                 self.proc.wait(timeout=5)
-                leader_was_reaped = True
             except subprocess.TimeoutExpired:
                 pass
         else:
@@ -219,7 +217,7 @@ class PendingWorkerProcess:
             raise UnknownWorkerProcess(
                 "cannot prove pending worker group termination"
             )
-        if leader_is_current or leader_was_reaped:
+        if leader_is_current:
             try:
                 os.killpg(self.identity.pgid, signal.SIGKILL)
             except ProcessLookupError:
@@ -237,11 +235,7 @@ class PendingWorkerProcess:
             raise UnknownWorkerProcess(
                 "verified pending worker group survived SIGKILL"
             )
-        else:
-            if not _identity_matches(self.identity):
-                raise UnknownWorkerProcess(
-                    "cannot safely kill reused process identity"
-                )
+        raise UnknownWorkerProcess("cannot safely kill reused process identity")
 
 
 def _spawn_behind_bootstrap(
@@ -10810,7 +10804,7 @@ def _bind_pending_worker(
     *,
     run_id: int,
     claim_lock: str,
-) -> bool:
+) -> str | Literal[False]:
     """Atomically bind a blocked process to the exact claimed task and run."""
     if not _identity_matches(pending.identity):
         return False
@@ -10869,7 +10863,7 @@ def _bind_pending_worker(
             )
     except _FenceReapCasLost:
         return False
-    return True
+    return raw_fence
 
 
 def _record_and_abort_failed_bind(
@@ -10934,6 +10928,121 @@ def _invoke_worker_spawn(
     return spawn_fn(task, workspace)
 
 
+def _record_post_bind_release_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    error: str,
+    run_id: int,
+    claim_lock: str,
+    raw_fence: str,
+    failure_limit: int,
+) -> bool:
+    """Terminalize one exact bound attempt while retaining its dead fence."""
+    now = int(time.time())
+    with _control_plane_write_txn(conn):
+        task = conn.execute(
+            "SELECT status, current_run_id, claim_lock, worker_pid, worker_pgid, "
+            "worker_identity, worker_fence, consecutive_failures, max_retries "
+            "FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        run = conn.execute(
+            "SELECT task_id, status, claim_lock, worker_pid, worker_pgid, "
+            "worker_identity, worker_fence, ended_at "
+            "FROM task_runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        exact = (
+            task is not None
+            and run is not None
+            and task["status"] == "running"
+            and task["current_run_id"] == run_id
+            and task["claim_lock"] == claim_lock
+            and task["worker_fence"] == raw_fence
+            and run["task_id"] == task_id
+            and run["status"] == "running"
+            and run["claim_lock"] == claim_lock
+            and run["worker_fence"] == raw_fence
+            and run["ended_at"] is None
+            and (
+                task["worker_pid"],
+                task["worker_pgid"],
+                task["worker_identity"],
+            )
+            == (
+                run["worker_pid"],
+                run["worker_pgid"],
+                run["worker_identity"],
+            )
+        )
+        if not exact:
+            raise SpawnBindError(
+                "post-bind release failure lost exact attempt ownership"
+            )
+        retry_status = _retry_status_for_run(conn, task_id, run_id)
+        failures = int(task["consecutive_failures"]) + 1
+        effective_limit = (
+            int(task["max_retries"])
+            if task["max_retries"] is not None
+            else int(failure_limit)
+        )
+        blocked = failures >= effective_limit
+        task_status = "blocked" if blocked else retry_status
+        outcome = "gave_up" if blocked else "spawn_failed"
+        metadata = {
+            "failures": failures,
+            "retry_status": retry_status,
+            "trigger_outcome": "spawn_failed" if blocked else None,
+        }
+        task_cur = conn.execute(
+            "UPDATE tasks SET status=?, consecutive_failures=?, "
+            "last_failure_error=? WHERE id=? AND status='running' "
+            "AND current_run_id=? AND claim_lock=? AND worker_fence=?",
+            (
+                task_status,
+                failures,
+                error[:500],
+                task_id,
+                run_id,
+                claim_lock,
+                raw_fence,
+            ),
+        )
+        run_cur = conn.execute(
+            "UPDATE task_runs SET status=?, outcome=?, error=?, metadata=?, "
+            "ended_at=? WHERE id=? AND task_id=? AND status='running' "
+            "AND claim_lock=? AND worker_fence=? AND ended_at IS NULL",
+            (
+                outcome,
+                outcome,
+                error[:500],
+                json.dumps(metadata, ensure_ascii=False),
+                now,
+                run_id,
+                task_id,
+                claim_lock,
+                raw_fence,
+            ),
+        )
+        if task_cur.rowcount != 1 or run_cur.rowcount != 1:
+            raise SpawnBindError(
+                "post-bind release failure CAS changed during transition"
+            )
+        _append_event(
+            conn,
+            task_id,
+            outcome,
+            {
+                "error": error[:500],
+                "failures": failures,
+                "retry_status": retry_status,
+            },
+            run_id=run_id,
+        )
+    return blocked
+
+
 def _spawn_bind_and_release(
     conn: sqlite3.Connection,
     task: Task,
@@ -10952,6 +11061,7 @@ def _spawn_bind_and_release(
     if task.current_run_id is None or not task.claim_lock:
         raise SpawnBindError("claimed task has no exact run/claim ownership")
     pending: Optional[PendingWorkerProcess] = None
+    bound_fence: Optional[str] = None
     try:
         candidate = _invoke_worker_spawn(
             spawn_fn,
@@ -10971,13 +11081,14 @@ def _spawn_bind_and_release(
                 detail = "spawn result is not a pending worker process"
             raise UnfencedSpawnContractError(detail)
         pending = candidate
-        if not _bind_pending_worker(
+        bind_result = _bind_pending_worker(
             conn,
             task.id,
             pending,
             run_id=task.current_run_id,
             claim_lock=task.claim_lock,
-        ):
+        )
+        if bind_result is False:
             _record_and_abort_failed_bind(
                 conn,
                 task.id,
@@ -10987,6 +11098,7 @@ def _spawn_bind_and_release(
             )
             pending = None
             return False, False
+        bound_fence = bind_result
         pending.release()
         _fire_worker_spawned_hook(
             conn,
@@ -11000,14 +11112,31 @@ def _spawn_bind_and_release(
     except (UnknownWorkerProcess, SpawnBindError):
         raise
     except Exception as exc:
-        auto_blocked = _handle_spawn_start_failure(
-            conn,
-            task.id,
-            error=str(exc),
-            run_id=task.current_run_id,
-            claim_lock=task.claim_lock,
-            failure_limit=failure_limit,
-        )
+        if bound_fence is not None:
+            if pending is None:
+                raise SpawnBindError(
+                    "bound worker ownership disappeared before release cleanup"
+                ) from exc
+            pending.abort()
+            pending = None
+            auto_blocked = _record_post_bind_release_failure(
+                conn,
+                task.id,
+                error=str(exc),
+                run_id=task.current_run_id,
+                claim_lock=task.claim_lock,
+                raw_fence=bound_fence,
+                failure_limit=failure_limit,
+            )
+        else:
+            auto_blocked = _handle_spawn_start_failure(
+                conn,
+                task.id,
+                error=str(exc),
+                run_id=task.current_run_id,
+                claim_lock=task.claim_lock,
+                failure_limit=failure_limit,
+            )
         return False, auto_blocked
     finally:
         if pending is not None:
@@ -12656,6 +12785,8 @@ def run_daemon(
                     on_tick(res)
                 except Exception:
                     pass
+        except (UnknownWorkerProcess, SpawnBindError):
+            raise
         except Exception:
             # Don't let any single tick kill the daemon.
             import traceback
