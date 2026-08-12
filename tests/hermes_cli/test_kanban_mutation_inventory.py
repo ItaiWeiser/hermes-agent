@@ -1,7 +1,10 @@
 import ast
+import contextlib
+import json
 import os
 import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -10,6 +13,7 @@ from hermes_cli import kanban_db as kb
 from tests.attempt_fence_helpers import (
     isolated_home,
     logical_board_snapshot,
+    process_tuple,
     registered_current_process,
 )
 
@@ -40,7 +44,7 @@ CLASSIFIED_INTERNAL_EFFECTS = frozenset(
         "_cleanup_worker_tmux",
         "_default_spawn",
         "_dispatch_once_locked",
-        "_deny_registered_worker_control_plane",
+        "_control_plane_write_txn",
         "_authorized_write_txn",
         "resolve_workspace",
         "build_worker_context",
@@ -91,6 +95,28 @@ CLASSIFIED_EXTERNAL_INTERNAL_EFFECT_EDGES = frozenset(
         "plugins/kanban/dashboard/plugin_api.py:_end_run",
         "tui_gateway/server.py:count_notify_subs",
         "gateway/kanban_watchers.py:count_notify_subs",
+    }
+)
+
+CLASSIFIED_BOOTSTRAP_PROCESS_EFFECTS = frozenset()
+
+TRANSACTIONAL_CONTROL_PLANE_SURFACES = frozenset(
+    {
+        "claim_task",
+        "claim_review_task",
+        "_reserve_terminal_fence_candidates",
+        "_reclaim_proven_dead_fenced_attempt",
+        "_defer_reclaim_for_live_worker",
+        "_set_worker_pid",
+        "release_stale_claims",
+        "reap_terminal_attempt_fences",
+        "reclaim_task",
+        "enforce_max_runtime",
+        "detect_stale_running",
+        "reconcile_orphaned_running",
+        "detect_crashed_workers",
+        "_dispatch_once_locked",
+        "gc_events",
     }
 )
 
@@ -145,6 +171,10 @@ def _derived_effect_functions(source: str) -> set[str]:
                         "DROP",
                         "VACUUM",
                         "PRAGMA JOURNAL_MODE",
+                        "PRAGMA WAL_CHECKPOINT",
+                        "BEGIN",
+                        "COMMIT",
+                        "ROLLBACK",
                     )
                 )
         if name in {"run", "check_call", "check_output"}:
@@ -185,6 +215,10 @@ def _derived_effect_functions(source: str) -> set[str]:
                 "ALTER ",
                 "DROP ",
                 "VACUUM",
+                "PRAGMA WAL_CHECKPOINT",
+                "BEGIN ",
+                "COMMIT",
+                "ROLLBACK",
             )
         )
 
@@ -197,6 +231,49 @@ def _derived_effect_functions(source: str) -> set[str]:
             or has_indirect_sql_write(node)
         )
     }
+
+
+def _derived_bootstrap_process_effects(source: str) -> set[str]:
+    """Return class-qualified functions that own OS process/FD effects."""
+    module = ast.parse(source)
+    process_calls = {
+        "os.write",
+        "os.close",
+        "os.execv",
+        "os.execve",
+        "os.kill",
+        "os.killpg",
+        "os.waitpid",
+        "subprocess.Popen",
+    }
+
+    def dotted_name(node):
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+        return ".".join(reversed(parts))
+
+    discovered = set()
+
+    def visit_function(node, prefix=""):
+        if any(
+            isinstance(child, ast.Call)
+            and dotted_name(child.func) in process_calls
+            for child in ast.walk(node)
+        ):
+            discovered.add(f"{prefix}{node.name}")
+
+    for node in module.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            visit_function(node)
+        elif isinstance(node, ast.ClassDef):
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    visit_function(child, f"{node.name}.")
+    return discovered
 
 
 def test_derived_mutation_inventory_has_no_unknown_surface():
@@ -218,12 +295,20 @@ def test_derived_mutation_inventory_has_no_unknown_surface():
     )
     unknown = discovered - classified
     assert unknown == set(), f"unclassified Hermes mutation surfaces: {sorted(unknown)}"
+    derived_classifications = (
+        set(CLASSIFIED_INTERNAL_EFFECTS)
+        | set(CLASSIFIED_INFRASTRUCTURE_EFFECTS)
+        | set(CLASSIFIED_PURE_FALSE_POSITIVES)
+        | set(EXPLICIT_PRIVATE_ENTRY_EFFECTS)
+    )
+    stale = derived_classifications - discovered
+    assert stale == set(), f"stale Hermes effect classifications: {sorted(stale)}"
 
     gate_calls = {
         "_authorize_mutation_locked",
-            "_deny_registered_worker_control_plane_locked",
-            "_deny_registered_worker_control_plane",
-            "_authorized_write_txn",
+        "_deny_registered_worker_control_plane_locked",
+        "_authorized_write_txn",
+        "_control_plane_write_txn",
         "_deny_registered_worker_filesystem_control_plane",
         "_authorize_filesystem_mutation",
     }
@@ -239,6 +324,63 @@ def test_derived_mutation_inventory_has_no_unknown_surface():
             if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
         }
         assert calls & gate_calls, f"ungated Hermes mutation surface: {name}"
+
+
+def test_bootstrap_process_inventory_is_qualified_and_exhaustive():
+    bootstrap_path = Path(kb.__file__).with_name("process_bootstrap.py")
+    discovered = _derived_bootstrap_process_effects(
+        bootstrap_path.read_text(encoding="utf-8")
+    )
+    assert discovered == set(CLASSIFIED_BOOTSTRAP_PROCESS_EFFECTS)
+
+    sample = """
+import os
+import subprocess
+class PendingWorkerProcess:
+    def _close_gate(self): os.close(self.fd)
+    def release(self): os.write(self.fd, b'x')
+    def abort(self): os.kill(self.pid, 9)
+def main(): os.execv('/bin/true', ['true'])
+"""
+    assert _derived_bootstrap_process_effects(sample) == {
+        "PendingWorkerProcess._close_gate",
+        "PendingWorkerProcess.release",
+        "PendingWorkerProcess.abort",
+        "main",
+    }
+
+
+def test_control_plane_inventory_rejects_split_transaction_gates():
+    source = Path(kb.__file__).read_text(encoding="utf-8")
+    functions = {
+        node.name: node
+        for node in ast.parse(source).body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for name in TRANSACTIONAL_CONTROL_PLANE_SURFACES:
+        calls = {
+            child.func.id
+            for child in ast.walk(functions[name])
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+        }
+        assert "_deny_registered_worker_control_plane" not in calls, (
+            f"{name} authorizes in a transaction that ends before its writes"
+        )
+        assert "_control_plane_write_txn" in calls, (
+            f"{name} lacks a same-transaction control-plane gate"
+        )
+        assert "write_txn" not in calls, (
+            f"{name} contains an ungated direct write transaction"
+        )
+
+    for name in {"reassign_task", "dispatch_once"}:
+        calls = {
+            child.func.id
+            for child in ast.walk(functions[name])
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+        }
+        assert "_deny_registered_worker_control_plane" not in calls
+        assert "_deny_registered_worker_filesystem_control_plane" in calls
 
 
 def test_external_call_edges_use_only_public_or_explicit_private_effects():
@@ -587,3 +729,222 @@ def test_registered_group_connects_existing_own_board_without_migration(
         assert comment_id > 0
     finally:
         conn.close()
+
+
+@pytest.mark.macos_only
+def test_worker_graph_mutation_requires_own_attempt_as_an_endpoint(
+    registered_current_process,
+):
+    fixture = registered_current_process
+    parent_id = kb.create_task(fixture.conn, title="unrelated parent")
+    child_id = kb.create_task(fixture.conn, title="unrelated child")
+    fixture.conn.execute(
+        "INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)",
+        (parent_id, child_id),
+    )
+    fixture.conn.commit()
+    before = logical_board_snapshot(fixture.conn)
+
+    with pytest.raises(kb.FencedTargetError):
+        kb.unlink_tasks(fixture.conn, parent_id, child_id)
+    with pytest.raises(kb.FencedTargetError):
+        kb.link_tasks(fixture.conn, child_id, parent_id)
+
+    assert logical_board_snapshot(fixture.conn) == before
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("own_is_parent", [True, False])
+@pytest.mark.parametrize("operation", ["link", "unlink"])
+def test_worker_graph_mutation_allows_own_attempt_endpoint_only(
+    registered_current_process,
+    own_is_parent,
+    operation,
+):
+    fixture = registered_current_process
+    other_id = kb.create_task(fixture.conn, title="attempt-related node")
+    parent_id, child_id = (
+        (fixture.task_id, other_id)
+        if own_is_parent
+        else (other_id, fixture.task_id)
+    )
+    if operation == "unlink":
+        fixture.conn.execute(
+            "INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)",
+            (parent_id, child_id),
+        )
+        fixture.conn.commit()
+        assert kb.unlink_tasks(fixture.conn, parent_id, child_id) is True
+        assert fixture.conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+            (parent_id, child_id),
+        ).fetchone() is None
+    else:
+        kb.link_tasks(fixture.conn, parent_id, child_id)
+        assert fixture.conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+            (parent_id, child_id),
+        ).fetchone() is not None
+
+
+def test_unlink_and_ready_recompute_roll_back_together(isolated_home, monkeypatch):
+    conn = kb.connect()
+    try:
+        parent_id = kb.create_task(conn, title="parent")
+        child_id = kb.create_task(conn, title="child")
+        kb.link_tasks(conn, parent_id, child_id)
+        before = logical_board_snapshot(conn)
+
+        def fail_recompute(*_args, **_kwargs):
+            raise RuntimeError("forced recompute failure")
+
+        monkeypatch.setattr(kb, "recompute_ready", fail_recompute)
+        with pytest.raises(RuntimeError, match="forced recompute failure"):
+            kb.unlink_tasks(conn, parent_id, child_id)
+        assert logical_board_snapshot(conn) == before
+    finally:
+        conn.close()
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("operation", ["archive", "schedule"])
+def test_worker_terminal_lifecycle_preserves_exact_attempt_tuple(
+    registered_current_process,
+    operation,
+):
+    fixture = registered_current_process
+    before_task = process_tuple(kb.get_task(fixture.conn, fixture.task_id))
+    before_run = tuple(
+        fixture.conn.execute(
+            "SELECT claim_lock, worker_pid, worker_pgid, worker_identity, worker_fence "
+            "FROM task_runs WHERE id=?",
+            (fixture.claimed.current_run_id,),
+        ).fetchone()
+    )
+
+    if operation == "archive":
+        assert kb.archive_task(fixture.conn, fixture.task_id) is True
+        expected_status = "archived"
+    else:
+        assert kb.schedule_task(
+            fixture.conn,
+            fixture.task_id,
+            reason="authorized terminal park",
+            expected_run_id=fixture.claimed.current_run_id,
+        ) is True
+        expected_status = "scheduled"
+
+    task = kb.get_task(fixture.conn, fixture.task_id)
+    assert task.status == expected_status
+    assert process_tuple(task) == before_task
+    run = fixture.conn.execute(
+        "SELECT claim_lock, worker_pid, worker_pgid, worker_identity, worker_fence, "
+        "ended_at FROM task_runs WHERE id=?",
+        (fixture.claimed.current_run_id,),
+    ).fetchone()
+    assert tuple(run)[:5] == before_run
+    assert run["ended_at"] is not None
+
+
+def test_claim_review_authorization_and_mutation_use_one_transaction(isolated_home):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="review target")
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+        conn.commit()
+        statements = []
+        conn.set_trace_callback(statements.append)
+        assert kb.claim_review_task(conn, task_id, claimer="reviewer") is not None
+        begins = [sql for sql in statements if sql.strip().upper() == "BEGIN IMMEDIATE"]
+        assert len(begins) == 1
+    finally:
+        conn.set_trace_callback(None)
+        conn.close()
+
+
+@pytest.mark.macos_only
+def test_claim_review_has_no_registration_race_between_gate_and_write(
+    isolated_home,
+    monkeypatch,
+):
+    conn = kb.connect()
+    try:
+        review_id = kb.create_task(conn, title="review target")
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (review_id,))
+        worker_id = kb.create_task(conn, title="worker registration")
+        claimed = kb.claim_task(conn, worker_id, claimer="fixture:claim")
+        conn.commit()
+        identity = kb._darwin_process_identity(os.getpgid(0))
+        assert identity is not None
+        raw_fence = json.dumps(
+            {
+                "run_id": claimed.current_run_id,
+                "claim_lock": claimed.claim_lock,
+                "host": kb._host_id(),
+                "leader_pid": identity.pid,
+                "worker_pgid": identity.pgid,
+                "worker_identity": identity.token,
+                "reason": "race",
+                "created_at": int(time.time()),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        real_write_txn = kb.write_txn
+        calls = 0
+        injected = False
+
+        @contextlib.contextmanager
+        def adversarial_write_txn(target_conn, *args, **kwargs):
+            nonlocal calls, injected
+            calls += 1
+            if calls == 2:
+                injected = True
+                target_conn.execute(
+                    "UPDATE tasks SET worker_pid=?, worker_pgid=?, worker_identity=?, "
+                    "worker_fence=? WHERE id=?",
+                    (identity.pid, identity.pgid, identity.token, raw_fence, worker_id),
+                )
+                target_conn.execute(
+                    "UPDATE task_runs SET worker_pid=?, worker_pgid=?, worker_identity=?, "
+                    "worker_fence=? WHERE id=?",
+                    (
+                        identity.pid,
+                        identity.pgid,
+                        identity.token,
+                        raw_fence,
+                        claimed.current_run_id,
+                    ),
+                )
+                target_conn.commit()
+            with real_write_txn(target_conn, *args, **kwargs):
+                yield
+
+        monkeypatch.setattr(kb, "write_txn", adversarial_write_txn)
+        try:
+            result = kb.claim_review_task(conn, review_id, claimer="reviewer")
+        except kb.RegisteredWorkerControlPlaneError:
+            result = None
+        if injected:
+            assert result is None
+            assert kb.get_task(conn, review_id).status == "review"
+        else:
+            assert calls == 1
+            assert result is not None
+    finally:
+        conn.close()
+
+
+@pytest.mark.macos_only
+def test_registered_worker_connect_rejects_missing_terminal_reaper_schema(
+    registered_current_process,
+):
+    fixture = registered_current_process
+    board_path = fixture.board_path
+    fixture.conn.execute("DROP TABLE terminal_fence_reap_state")
+    fixture.conn.commit()
+    fixture.conn.close()
+    before = board_path.read_bytes()
+    with pytest.raises(kb.AttemptFenceCapabilityError):
+        kb.connect(board_path)
+    assert board_path.read_bytes() == before
