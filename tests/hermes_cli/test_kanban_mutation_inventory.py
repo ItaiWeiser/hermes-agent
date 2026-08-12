@@ -383,6 +383,25 @@ def test_control_plane_inventory_rejects_split_transaction_gates():
         assert "_deny_registered_worker_filesystem_control_plane" in calls
 
 
+def test_nested_ready_continuations_are_statically_target_bounded():
+    source = Path(kb.__file__).read_text(encoding="utf-8")
+    module = ast.parse(source)
+    violations = []
+    for node in ast.walk(module):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "recompute_ready"
+        ):
+            continue
+        keyword_names = {keyword.arg for keyword in node.keywords}
+        if "_mutation_auth" in keyword_names and "target_task_ids" not in keyword_names:
+            violations.append(getattr(node, "lineno", None))
+    assert violations == [], (
+        f"nested recompute_ready calls lack bounded targets at lines {violations}"
+    )
+
+
 def test_external_call_edges_use_only_public_or_explicit_private_effects():
     root = Path(kb.__file__).resolve().parents[1]
     source = Path(kb.__file__).read_text(encoding="utf-8")
@@ -948,3 +967,89 @@ def test_registered_worker_connect_rejects_missing_terminal_reaper_schema(
     with pytest.raises(kb.AttemptFenceCapabilityError):
         kb.connect(board_path)
     assert board_path.read_bytes() == before
+
+
+def _task_event_snapshot(conn, task_id):
+    task = tuple(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
+    events = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT * FROM task_events WHERE task_id=? ORDER BY id", (task_id,)
+        )
+    ]
+    return task, events
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("operation", ["unlink", "complete", "archive"])
+def test_worker_nested_ready_continuation_is_bounded_to_affected_child(
+    registered_current_process,
+    operation,
+):
+    fixture = registered_current_process
+    child_id = kb.create_task(fixture.conn, title="affected child")
+    kb.link_tasks(fixture.conn, fixture.task_id, child_id)
+    unrelated_id = kb.create_task(fixture.conn, title="unrelated eligible")
+    fixture.conn.execute(
+        "UPDATE tasks SET status='todo' WHERE id=?", (unrelated_id,)
+    )
+    fixture.conn.commit()
+    unrelated_before = _task_event_snapshot(fixture.conn, unrelated_id)
+
+    if operation == "unlink":
+        assert kb.unlink_tasks(fixture.conn, fixture.task_id, child_id) is True
+    elif operation == "complete":
+        assert kb.complete_task(
+            fixture.conn,
+            fixture.task_id,
+            result="done",
+            expected_run_id=fixture.claimed.current_run_id,
+        ) is True
+    else:
+        assert kb.archive_task(fixture.conn, fixture.task_id) is True
+
+    assert kb.get_task(fixture.conn, child_id).status == "ready"
+    assert _task_event_snapshot(fixture.conn, unrelated_id) == unrelated_before
+
+
+def test_decompose_nested_ready_continuation_is_bounded_to_created_graph(
+    isolated_home,
+):
+    conn = kb.connect()
+    try:
+        root_id = kb.create_task(conn, title="triage root")
+        unrelated_id = kb.create_task(conn, title="unrelated eligible")
+        conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (root_id,))
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (unrelated_id,))
+        conn.commit()
+        unrelated_before = _task_event_snapshot(conn, unrelated_id)
+
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root_id,
+            root_assignee="dor-coo",
+            children=[{"title": "bounded child", "assignee": "yonatan"}],
+        )
+
+        assert child_ids and kb.get_task(conn, child_ids[0]).status == "ready"
+        assert _task_event_snapshot(conn, unrelated_id) == unrelated_before
+    finally:
+        conn.close()
+
+
+def test_operator_recompute_ready_remains_board_wide(isolated_home):
+    conn = kb.connect()
+    try:
+        first_id = kb.create_task(conn, title="first eligible")
+        second_id = kb.create_task(conn, title="second eligible")
+        conn.execute(
+            "UPDATE tasks SET status='todo' WHERE id IN (?, ?)",
+            (first_id, second_id),
+        )
+        conn.commit()
+
+        assert kb.recompute_ready(conn) == 2
+        assert kb.get_task(conn, first_id).status == "ready"
+        assert kb.get_task(conn, second_id).status == "ready"
+    finally:
+        conn.close()

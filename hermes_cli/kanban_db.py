@@ -4504,7 +4504,11 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
         if removed:
             # Edge deletion and dependent promotion are one logical mutation.
             # A recompute failure must roll the edge and event back together.
-            recompute_ready(conn, _mutation_auth=authorization)
+            recompute_ready(
+                conn,
+                _mutation_auth=authorization,
+                target_task_ids=(child_id,),
+            )
     return removed
 
 
@@ -5395,12 +5399,14 @@ def recompute_ready(
     failure_limit: int = None,
     *,
     _mutation_auth: Optional[_MutationAuthorization] = None,
+    target_task_ids: Optional[Iterable[str]] = None,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
-    Returns the number of tasks promoted.  Opens its own IMMEDIATE txn, so it
-    MUST be called OUTSIDE any open write transaction (plain ``write_txn``
-    raises on nesting); call it after the enclosing txn commits.
+    Returns the number of tasks promoted. Public/operator calls default to the
+    historical board-wide sweep. Authorized nested continuations must pass
+    ``target_task_ids`` so their inherited authority is bounded to the tasks
+    affected by the enclosing mutation.
 
     ``blocked`` tasks are also considered for promotion (so a task
     blocked purely by a parent dependency unblocks itself when the
@@ -5428,17 +5434,30 @@ def recompute_ready(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
+    bounded_ids = (
+        tuple(sorted({str(task_id) for task_id in target_task_ids if task_id}))
+        if target_task_ids is not None
+        else None
+    )
     prepared_provenance = (
         _mutation_auth.provenance
         if _mutation_auth is not None
         else _prepare_mutation_provenance()
     )
     with write_txn(conn, allow_nested=_mutation_auth is not None):
-        todo_rows = conn.execute(
+        sql = (
             "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked') "
             "AND worker_fence IS NULL"
-        ).fetchall()
+        )
+        params: tuple[Any, ...] = ()
+        if bounded_ids is not None:
+            if not bounded_ids:
+                return 0
+            placeholders = ",".join("?" for _ in bounded_ids)
+            sql += f" AND id IN ({placeholders})"
+            params = bounded_ids
+        todo_rows = conn.execute(sql, params).fetchall()
         _authorize_mutation_locked(
             conn,
             target_task_ids=tuple(row["id"] for row in todo_rows),
@@ -6657,7 +6676,11 @@ def complete_task(
         _clear_failure_counter(
             conn, task_id, _mutation_auth=authorization,
         )
-        recompute_ready(conn, _mutation_auth=authorization)
+        recompute_ready(
+            conn,
+            _mutation_auth=authorization,
+            target_task_ids=child_ids(conn, task_id),
+        )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -8415,7 +8438,11 @@ def specify_triage_task(
             "specified",
             {"changed_fields": changed_fields} if changed_fields else None,
         )
-        recompute_ready(conn, _mutation_auth=authorization)
+        recompute_ready(
+            conn,
+            _mutation_auth=authorization,
+            target_task_ids=(task_id,),
+        )
     # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
     # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
     # logic the dispatcher would on its next tick, so a specified task
@@ -8648,7 +8675,11 @@ def decompose_triage_task(
         )
 
         if auto_promote:
-            recompute_ready(conn, _mutation_auth=authorization)
+            recompute_ready(
+                conn,
+                _mutation_auth=authorization,
+                target_task_ids=(*child_ids, task_id),
+            )
 
     # Outside the write_txn: promote parent-free children to 'ready'
     # so the dispatcher picks them up on its next tick. Same pattern
@@ -8682,7 +8713,11 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
-        recompute_ready(conn, _mutation_auth=authorization)
+        recompute_ready(
+            conn,
+            _mutation_auth=authorization,
+            target_task_ids=child_ids(conn, task_id),
+        )
     # Reap the workspace on archive too — tasks archived without ever
     # completing previously kept their scratch dir / worktree forever.
     _cleanup_workspace(conn, task_id)
@@ -8730,6 +8765,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
             raise RegisteredWorkerControlPlaneError(
                 "registered workers cannot delete their own registration row"
             )
+        affected_children = child_ids(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -8738,7 +8774,11 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-        recompute_ready(conn, _mutation_auth=authorization)
+        recompute_ready(
+            conn,
+            _mutation_auth=authorization,
+            target_task_ids=affected_children,
+        )
     return True
 
 
