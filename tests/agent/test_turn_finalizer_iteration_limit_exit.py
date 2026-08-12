@@ -235,6 +235,91 @@ def test_iteration_timeout_without_exact_attempt_does_not_record(monkeypatch):
     record.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("raw_run_id", "claim_lock"),
+    [
+        ("", "claim-exact"),
+        ("0", "claim-exact"),
+        ("-1", "claim-exact"),
+        ("+1", "claim-exact"),
+        ("01", "claim-exact"),
+        ("1.0", "claim-exact"),
+        (" 1", "claim-exact"),
+        ("1 ", "claim-exact"),
+        ("not-an-integer", "claim-exact"),
+        ("1", ""),
+        ("1", " "),
+    ],
+)
+def test_iteration_timeout_with_malformed_attempt_does_not_open_db(
+    monkeypatch, raw_run_id, claim_lock
+):
+    """Malformed ownership input must fail before any board access."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", raw_run_id)
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
+    connect = MagicMock(name="connect")
+    record = MagicMock(name="record_task_failure")
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", connect)
+    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+
+    _finalize(
+        _LimitAgent(),
+        final_response=None,
+        exit_reason="unknown",
+        pending_verification_response="composed report",
+    )
+
+    connect.assert_not_called()
+    record.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "raw_limit",
+    [
+        True,
+        False,
+        1.0,
+        2.5,
+        "1",
+        "2",
+        " 2 ",
+        "",
+        None,
+        0,
+        -1,
+        {},
+        [],
+    ],
+)
+def test_iteration_timeout_malformed_failure_limit_uses_default(
+    monkeypatch, raw_limit
+):
+    """Only a positive built-in int satisfies the YAML config contract."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "41")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "claim-exact")
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"failure_limit": raw_limit}},
+    )
+    record = MagicMock(name="record_task_failure")
+    conn = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
+    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+
+    _finalize(
+        _LimitAgent(),
+        final_response=None,
+        exit_reason="unknown",
+        pending_verification_response="composed report",
+    )
+
+    assert record.call_args.kwargs["failure_limit"] == 2
+
+
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
     """When budget exhaustion preserves a verification candidate that is
     already the tail assistant message, the finalizer must NOT append a
