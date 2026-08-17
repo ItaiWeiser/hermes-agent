@@ -12,7 +12,9 @@ dispatcher.
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import subprocess
 import time
 from pathlib import Path
 
@@ -76,25 +78,40 @@ def test_dispatch_spawn_fires_worker_spawned(
     mgr = get_plugin_manager()
     mgr._hooks.setdefault("on_kanban_worker_spawned", []).append(_read_pid)
 
+    pending_holder = {}
+
+    def _pending_spawn(task, workspace, board=None):
+        pending = kb._spawn_behind_bootstrap(
+            ["/usr/bin/true"],
+            env=os.environ,
+            cwd=workspace,
+            stdout=subprocess.DEVNULL,
+        )
+        pending_holder["pending"] = pending
+        return pending
+
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="t", assignee="alice")
-        result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242)
+        result = kb.dispatch_once(conn, spawn_fn=_pending_spawn)
         assert any(row[0] == tid for row in result.spawned)
     finally:
         conn.close()
+
+    pending = pending_holder["pending"]
+    pending.proc.wait(timeout=5)
 
     fired = [e for e in captured_hooks if e[0] == "on_kanban_worker_spawned"]
     assert len(fired) == 1
     kw = fired[0][1]
     assert kw["task_id"] == tid
     assert kw["assignee"] == "alice"
-    assert kw["worker_pid"] == 4242
+    assert kw["worker_pid"] == pending.identity.pid
     assert kw["workspace_path"]
     assert kw["run_id"] is not None
     assert "profile_name" in kw
     assert "board" in kw
-    assert pid_at_fire_time == [4242]
+    assert pid_at_fire_time == [pending.identity.pid]
 
 def test_crash_reclaim_fires_worker_exited(kanban_home, captured_hooks, monkeypatch):
     """A dead-PID reclaim fires the exit observer with the exit facts."""
@@ -165,9 +182,12 @@ def test_raising_callbacks_never_break_worker_lifecycle(
         conn = kb.connect()
         try:
             tid = kb.create_task(conn, title="t", assignee="alice")
-            result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 111)
+            # No real process is needed to prove callback exception isolation;
+            # ``None`` is the dispatcher's explicit no-process test seam.
+            result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
             assert any(row[0] == tid for row in result.spawned)
 
+            kb._set_worker_pid(conn, tid, 111)
             monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
             assert kb.detect_crashed_workers(conn) == [tid]
 
