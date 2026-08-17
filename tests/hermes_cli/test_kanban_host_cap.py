@@ -42,7 +42,10 @@ def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> Non
 def _fake_spawn_factory(spawns: list):
     def fake_spawn(task, workspace, board=None):
         spawns.append(task.id)
-        return 42
+        # These tests exercise scheduling/accounting only.  ``None`` is the
+        # explicit no-process compatibility seam; returning a legacy integer
+        # would correctly be rejected as an unfenced worker process.
+        return None
     return fake_spawn
 
 
