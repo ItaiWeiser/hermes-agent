@@ -416,6 +416,37 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_forwards_explicit_board_to_kernel(monkeypatch, worker_env):
+    """Project inference must use the explicitly addressed board.
+
+    The handler already opens that board's database. If it then omits the
+    board argument to ``create_task``, the kernel can infer project identity
+    from an unrelated globally selected board and create a cross-project row.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb.create_board("alternate")
+    original_create_task = kb.create_task
+    captured = {}
+
+    def recording_create_task(conn, **kwargs):
+        captured["board"] = kwargs.get("board")
+        return original_create_task(conn, **kwargs)
+
+    monkeypatch.setattr(kb, "create_task", recording_create_task)
+    out = kt._handle_create({
+        "title": "explicit-board child",
+        "assignee": "peer",
+        "board": "alternate",
+        "workspace_kind": "scratch",
+    })
+
+    assert json.loads(out)["ok"] is True
+    assert captured["board"] == "alternate"
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
