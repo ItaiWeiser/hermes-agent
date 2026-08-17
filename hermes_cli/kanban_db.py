@@ -390,6 +390,7 @@ REGISTERED_WORKER_DENIED_SURFACES = frozenset(
         "run_daemon",
         "gc_events",
         "gc_worker_logs",
+        "purge_stale_done_notify_subs",
     }
 )
 
@@ -13496,7 +13497,7 @@ def purge_stale_done_notify_subs(
     if days <= 0:
         return 0
     cutoff = int(time.time()) - days * 86400
-    with write_txn(conn):
+    with _control_plane_write_txn(conn):
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id IN ("
             " SELECT t.id FROM tasks t"

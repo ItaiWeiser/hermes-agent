@@ -39,6 +39,7 @@ CLASSIFIED_INTERNAL_EFFECTS = frozenset(
         "_reserve_terminal_fence_candidates",
         "_persist_scratch_completion_artifacts",
         "_cleanup_workspace",
+        "_cleanup_worktree_workspace",
         "_try_cleanup_parent_workspaces",
         "_mark_scratch_tip_shown",
         "_maybe_emit_scratch_tip",
@@ -68,6 +69,7 @@ CLASSIFIED_INFRASTRUCTURE_EFFECTS = frozenset(
         "_attempt_index_reindex_repair",
         "_migrate_add_optional_columns",
         "_rebuild_drifted_tables",
+        "notify_task_updated",
     }
 )
 
@@ -80,6 +82,7 @@ CLASSIFIED_PURE_FALSE_POSITIVES = frozenset(
         "_check_file_length_invariant",
         "_guard_existing_db_is_healthy",
         "count_notify_subs",
+        "count_running_tasks_other_boards",
         "_git_branch_exists",
         "_git_current_branch",
     }
@@ -94,6 +97,7 @@ CLASSIFIED_EXTERNAL_INTERNAL_EFFECT_EDGES = frozenset(
         "hermes_cli/kanban_swarm.py:_append_event",
         "hermes_cli/kanban.py:resolve_workspace",
         "hermes_cli/kanban.py:build_worker_context",
+        "hermes_cli/kanban.py:_cleanup_worktree_workspace",
         "plugins/kanban/dashboard/plugin_api.py:_safe_attachment_name",
         "plugins/kanban/dashboard/plugin_api.py:_terminate_reclaimed_worker",
         "plugins/kanban/dashboard/plugin_api.py:_end_run",
@@ -108,6 +112,7 @@ CLASSIFIED_PROCESS_FD_EFFECTS = frozenset({
     "hermes_cli/kanban_db.py:PendingWorkerProcess.abort",
     "hermes_cli/kanban_db.py:PendingWorkerProcess.release",
     "hermes_cli/kanban_db.py:_cleanup_worker_tmux",
+    "hermes_cli/kanban_db.py:_cleanup_worktree_workspace",
     "hermes_cli/kanban_db.py:_ensure_git_worktree",
     "hermes_cli/kanban_db.py:_fenced_group_state",
     "hermes_cli/kanban_db.py:_git_branch_exists",
@@ -138,6 +143,7 @@ TRANSACTIONAL_CONTROL_PLANE_SURFACES = frozenset(
         "detect_crashed_workers",
         "_dispatch_once_locked",
         "gc_events",
+        "purge_stale_done_notify_subs",
     }
 )
 
