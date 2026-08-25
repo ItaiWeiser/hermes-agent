@@ -6061,9 +6061,26 @@ def _reclaim_proven_dead_fenced_attempt(
     retry_status: str,
     error: str,
     payload: dict[str, Any],
+    account_failure: bool = False,
+    failure_limit: int = None,
 ) -> bool:
     """Atomically close and clear one exact, proven-dead fenced attempt."""
     now = int(time.time())
+    blocked = False
+    failures = 0
+    effective_limit = 0
+    limit_source = "dispatcher"
+    if account_failure:
+        failures = int(row["consecutive_failures"]) + 1
+        task_override = row["max_retries"]
+        if task_override is not None:
+            effective_limit = int(task_override)
+            limit_source = "task"
+        else:
+            effective_limit = int(
+                DEFAULT_FAILURE_LIMIT if failure_limit is None else failure_limit
+            )
+        blocked = failures >= effective_limit
     exact = (
         row["worker_fence"],
         row["worker_pid"],
@@ -6122,6 +6139,34 @@ def _reclaim_proven_dead_fenced_attempt(
                 payload,
                 run_id=int(row["current_run_id"]),
             )
+            if account_failure:
+                conn.execute(
+                    "UPDATE tasks SET status=?, consecutive_failures=?, "
+                    "last_failure_error=? WHERE id=?",
+                    (
+                        "blocked" if blocked else retry_status,
+                        failures,
+                        error[:500],
+                        row["id"],
+                    ),
+                )
+            if account_failure and blocked:
+                gave_up_payload = {
+                    "failures": failures,
+                    "effective_limit": effective_limit,
+                    "limit_source": limit_source,
+                    "error": error[:500],
+                    "trigger_outcome": "reclaimed",
+                    "retry_status": retry_status,
+                }
+                gave_up_payload.update(payload)
+                _append_event(
+                    conn,
+                    row["id"],
+                    "gave_up",
+                    gave_up_payload,
+                    run_id=None,
+                )
     except _FenceReapCasLost:
         return False
     return True
@@ -6131,6 +6176,7 @@ def release_stale_claims(
     conn: sqlite3.Connection,
     *,
     signal_fn=None,
+    failure_limit: int = None,
 ) -> int:
     """Reset any ``running`` task whose claim has expired.
 
@@ -6164,7 +6210,7 @@ def release_stale_claims(
     stale = conn.execute(
         "SELECT id, current_run_id, claim_lock, worker_pid, worker_pgid, "
         "worker_identity, worker_fence, claim_expires, last_heartbeat_at, "
-        "assignee, "
+        "assignee, consecutive_failures, max_retries, "
         "(SELECT ended_at FROM task_runs WHERE id=current_run_id) "
         "AS run_ended_at "
         "FROM tasks "
@@ -6199,6 +6245,8 @@ def release_stale_claims(
                 retry_status=retry_status,
                 error=f"stale_lock={row['claim_lock']}",
                 payload=payload,
+                account_failure=True,
+                failure_limit=failure_limit,
             ):
                 reclaimed += 1
             continue
@@ -11755,7 +11803,9 @@ def _dispatch_once_locked(
         reap_terminal_attempt_fences(conn)
 
     result = DispatchResult()
-    result.reclaimed = release_stale_claims(conn)
+    result.reclaimed = release_stale_claims(
+        conn, failure_limit=failure_limit,
+    )
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
         # bookkeeping is broken (no valid claim, dead/gone worker) that the
