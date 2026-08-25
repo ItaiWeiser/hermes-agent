@@ -166,6 +166,53 @@ def test_stale_fenced_claim_is_never_mutated_without_proven_death(
     assert logical_board_snapshot(conn) == before
 
 
+@darwin_only
+def test_dead_fenced_stale_claim_honors_dispatcher_single_attempt_budget(
+    conn,
+    monkeypatch,
+    worker_identity,
+):
+    """A dead fenced attempt honors the dispatcher's one-failure limit."""
+    task_id, claimed, _raw = create_bound_attempt(
+        conn,
+        leader_identity=worker_identity,
+    )
+    conn.execute(
+        "UPDATE tasks SET claim_expires=0 WHERE id=?",
+        (task_id,),
+    )
+    conn.commit()
+    monkeypatch.setattr(kb, "_fenced_group_state", lambda _fence: "dead")
+
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *_args, **_kwargs: None,
+        failure_limit=1,
+        max_spawn=1,
+    )
+    assert result.reclaimed == 1
+    assert result.spawned == []
+
+    task = kb.get_task(conn, task_id)
+    assert task.status == "blocked"
+    assert task.consecutive_failures == 1
+    assert task.current_run_id is None
+    run = conn.execute(
+        "SELECT outcome FROM task_runs WHERE id=?",
+        (claimed.current_run_id,),
+    ).fetchone()
+    assert run["outcome"] == "reclaimed"
+    event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id=? AND kind='gave_up' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    payload = json.loads(event["payload"])
+    assert payload["trigger_outcome"] == "reclaimed"
+    assert payload["effective_limit"] == 1
+    assert payload["limit_source"] == "dispatcher"
+
+
 @pytest.mark.parametrize(
     ("group_state", "reason"),
     [("alive", "operator checked"), ("unknown", "operator checked"), ("dead", None)],
