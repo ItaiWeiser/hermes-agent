@@ -1642,6 +1642,48 @@ def _handle_unblock(args: dict, **kw) -> str:
         return tool_error(f"kanban_unblock: {e}")
 
 
+def _handle_stop(args: dict, **kw) -> str:
+    """Stop the exact live worker attempt and leave its task blocked."""
+    delegated_err = _reject_delegated_child_mutation("kanban_stop")
+    if delegated_err:
+        return delegated_err
+    guard = _require_orchestrator_tool("kanban_stop")
+    if guard:
+        return guard
+    tid = args.get("task_id")
+    reason = args.get("reason")
+    if not tid:
+        return tool_error("task_id is required")
+    if not isinstance(reason, str) or not reason.strip():
+        return tool_error("reason is required")
+    ownership_err = _enforce_worker_task_ownership(str(tid))
+    if ownership_err:
+        return ownership_err
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.stop_task(conn, str(tid), reason=reason.strip())
+            if not ok:
+                return tool_error(
+                    f"could not stop {tid} "
+                    "(not a live host-local fenced attempt, or ownership changed)"
+                )
+            task = kb.get_task(conn, str(tid))
+            return _ok(
+                task_id=str(tid),
+                status=task.status if task else None,
+                termination_pending=bool(task and task.worker_fence),
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_stop: {e}")
+    except Exception as e:
+        logger.exception("kanban_stop failed")
+        return tool_error(f"kanban_stop: {e}")
+
+
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact."""
     delegated_err = _reject_delegated_child_mutation("kanban_link")
@@ -2331,6 +2373,30 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_STOP_SCHEMA = {
+    "name": "kanban_stop",
+    "description": (
+        "Stop the exact live worker attempt and leave its task blocked. "
+        "Use only for an explicit operator/user stop; this is not retry or pause. "
+        "Orchestrator-only — dispatcher-spawned task workers never see this tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Running task id whose exact worker attempt must stop.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Explicit user/operator stop reason recorded on the task.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "reason"],
+    },
+}
+
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
@@ -2469,6 +2535,15 @@ registry.register(
     handler=_handle_unblock,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
+)
+
+registry.register(
+    name="kanban_stop",
+    toolset="kanban",
+    schema=KANBAN_STOP_SCHEMA,
+    handler=_handle_stop,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="⏹",
 )
 
 registry.register(

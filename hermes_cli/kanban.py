@@ -506,6 +506,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Human-readable reason (recorded on the reclaimed event)",
     )
 
+    p_stop = sub.add_parser(
+        "stop",
+        help="Stop the exact running worker and leave its task blocked",
+    )
+    p_stop.add_argument("task_id")
+    p_stop.add_argument(
+        "--reason", required=True,
+        help="Human-readable operator stop reason",
+    )
+
     p_reassign = sub.add_parser(
         "reassign",
         help="Reassign a task to a different profile, optionally reclaiming first",
@@ -1115,6 +1125,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
             "reclaim":  _cmd_reclaim,
+            "stop":     _cmd_stop,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
@@ -1186,6 +1197,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "swarm",
     "assign",
     "reclaim",
+    "stop",
     "reassign",
     "link",
     "unlink",
@@ -1906,6 +1918,27 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
         )
         return 1
     print(f"Reclaimed {args.task_id}")
+    return 0
+
+
+def _cmd_stop(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        ok = kb.stop_task(conn, args.task_id, reason=args.reason)
+        task = kb.get_task(conn, args.task_id) if ok else None
+    if not ok:
+        print(
+            f"cannot stop {args.task_id} "
+            "(not a live host-local fenced attempt, or ownership changed)",
+            file=sys.stderr,
+        )
+        return 1
+    if task is not None and task.worker_fence is not None:
+        print(
+            f"Stop accepted for {args.task_id}; task is blocked and exact "
+            "worker termination is pending"
+        )
+    else:
+        print(f"Stopped {args.task_id}; task is blocked")
     return 0
 
 

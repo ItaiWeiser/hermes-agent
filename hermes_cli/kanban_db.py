@@ -6481,6 +6481,185 @@ def reclaim_task(
     return True
 
 
+def _terminate_fenced_worker_group(
+    fence: Mapping[str, Any],
+    *,
+    signal_fn=None,
+) -> bool:
+    """Terminate one verified host-local fenced process group, fail closed."""
+    import signal
+
+    state = _fenced_group_state(fence)
+    if state == "dead":
+        return True
+    if state != "alive":
+        return False
+    worker_pgid = int(fence["worker_pgid"])
+    kill_group = signal_fn if signal_fn is not None else os.killpg
+    try:
+        kill_group(worker_pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        state = _fenced_group_state(fence)
+        if state == "dead":
+            return True
+        if state == "unknown":
+            return False
+        time.sleep(0.05)
+
+    try:
+        kill_group(worker_pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        state = _fenced_group_state(fence)
+        if state == "dead":
+            return True
+        if state == "unknown":
+            return False
+        time.sleep(0.05)
+    return False
+
+
+def stop_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    signal_fn=None,
+) -> bool:
+    """Operator stop: atomically block a live fenced attempt, then terminate it.
+
+    This is deliberately separate from ``reclaim_task``. Reclaim means retry;
+    stop means revoke the current attempt and leave the card non-runnable.
+    Only an exact, host-local Darwin fence is eligible. Unknown or foreign
+    ownership fails closed without changing board state or sending a signal.
+    """
+    _deny_registered_worker_filesystem_control_plane()
+    if not isinstance(reason, str) or not reason.strip():
+        return False
+    clean_reason = reason.strip()
+    row = conn.execute(
+        "SELECT t.id, t.status, t.current_run_id, t.claim_lock, t.worker_pid, "
+        "t.worker_pgid, t.worker_identity, t.worker_fence, "
+        "r.outcome AS run_outcome, r.ended_at AS run_ended_at "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id "
+        "WHERE t.id=?",
+        (task_id,),
+    ).fetchone()
+    if (
+        row is None
+        or row["current_run_id"] is None
+        or row["worker_fence"] is None
+    ):
+        return False
+    already_accepted = False
+    if row["status"] == "blocked" and row["run_outcome"] == "blocked":
+        prior = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+            "AND kind='blocked' ORDER BY id DESC LIMIT 1",
+            (task_id, row["current_run_id"]),
+        ).fetchone()
+        try:
+            prior_payload = json.loads(prior["payload"]) if prior else {}
+        except (json.JSONDecodeError, TypeError):
+            prior_payload = {}
+        already_accepted = bool(prior_payload.get("operator_stop"))
+    elif row["status"] != "running" or row["run_ended_at"] is not None:
+        return False
+    if row["status"] == "blocked" and not already_accepted:
+        return False
+    fence = _decoded_fence(row["worker_fence"])
+    if fence is None or _fenced_group_state(fence) not in {"alive", "dead"}:
+        return False
+
+    exact = (
+        row["worker_fence"],
+        row["worker_pid"],
+        row["worker_pgid"],
+        row["worker_identity"],
+    )
+    if not already_accepted:
+        now = int(time.time())
+        try:
+            with _control_plane_write_txn(conn):
+                run_cur = conn.execute(
+                    """
+                    UPDATE task_runs
+                       SET status='blocked', outcome='blocked', summary=?,
+                           ended_at=COALESCE(ended_at, ?)
+                     WHERE id=? AND task_id=? AND ended_at IS NULL
+                       AND worker_fence=? AND worker_pid IS ?
+                       AND worker_pgid IS ? AND worker_identity IS ?
+                    """,
+                    (
+                        clean_reason,
+                        now,
+                        row["current_run_id"],
+                        task_id,
+                        *exact,
+                    ),
+                )
+                if run_cur.rowcount != 1:
+                    raise _FenceReapCasLost
+                task_cur = conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status='blocked', block_kind='needs_input',
+                           block_recurrences=CASE
+                               WHEN block_kind='needs_input'
+                               THEN block_recurrences + 1 ELSE 1 END
+                     WHERE id=? AND status='running' AND current_run_id=?
+                       AND worker_fence=? AND worker_pid IS ?
+                       AND worker_pgid IS ? AND worker_identity IS ?
+                    """,
+                    (task_id, row["current_run_id"], *exact),
+                )
+                if task_cur.rowcount != 1:
+                    raise _FenceReapCasLost
+                _append_event(
+                    conn,
+                    task_id,
+                    "blocked",
+                    {
+                        "reason": clean_reason,
+                        "kind": "needs_input",
+                        "operator_stop": True,
+                        "source_status": "running",
+                    },
+                    run_id=int(row["current_run_id"]),
+                )
+        except _FenceReapCasLost:
+            return False
+
+    terminated = _terminate_fenced_worker_group(fence, signal_fn=signal_fn)
+    if terminated:
+        reap_terminal_attempt_fences(conn)
+    if not already_accepted:
+        stopped_task = get_task(conn, task_id)
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_blocked",
+            task_id,
+            board=get_current_board(),
+            assignee=stopped_task.assignee if stopped_task else None,
+            run_id=int(row["current_run_id"]),
+            reason=clean_reason,
+        )
+    # The logical stop is accepted once the exact attempt is blocked. If the
+    # signal could not be proven, a repeated stop safely retries termination
+    # against the same fence while the dispatcher remains unable to spawn it.
+    return True
+
+
 def reassign_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -13634,7 +13813,10 @@ def claim_unseen_events_for_sub(
     ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
     failed before any terminal unsubscribe removed the row.
     """
-    with _authorized_write_txn(conn, (task_id,)):
+    # Subscription cursors are trusted gateway delivery state, not task
+    # authority. A live worker fence protects task mutations without blocking
+    # the notifier's atomic read/claim CAS.
+    with _control_plane_write_txn(conn):
         row = conn.execute(
             "SELECT last_event_id FROM kanban_notify_subs "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
@@ -13671,7 +13853,7 @@ def advance_notify_cursor(
     thread_id: Optional[str] = None,
     new_cursor: int,
 ) -> None:
-    with _authorized_write_txn(conn, (task_id,)):
+    with _control_plane_write_txn(conn):
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
@@ -13695,7 +13877,7 @@ def rewind_notify_cursor(
     claim. This keeps retry behavior for transient send failures without
     clobbering newer progress.
     """
-    with _authorized_write_txn(conn, (task_id,)):
+    with _control_plane_write_txn(conn):
         cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "

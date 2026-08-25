@@ -719,6 +719,50 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
         conn.close()
 
 
+def test_worker_cannot_stop_a_task(worker_env):
+    """Stopping a live attempt is an orchestrator-only control action."""
+    from tools import kanban_tools as kt
+
+    out = kt._handle_stop({"task_id": worker_env, "reason": "stop"})
+    err = json.loads(out).get("error", "")
+    assert "orchestrator-only" in err or "refusing to mutate" in err
+
+
+def test_orchestrator_stop_routes_to_atomic_stop(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from tools import kanban_tools as kt
+
+    calls = []
+
+    class FakeConn:
+        def close(self):
+            pass
+
+    class FakeTask:
+        status = "blocked"
+        worker_fence = None
+
+    class FakeKb:
+        @staticmethod
+        def stop_task(conn, task_id, *, reason):
+            calls.append((conn, task_id, reason))
+            return True
+
+        @staticmethod
+        def get_task(_conn, _task_id):
+            return FakeTask()
+
+    conn = FakeConn()
+    monkeypatch.setattr(kt, "_require_orchestrator_tool", lambda _name: None)
+    monkeypatch.setattr(kt, "_connect", lambda **_kwargs: (FakeKb, conn))
+
+    out = kt._handle_stop({"task_id": "t_exact", "reason": "Itai stopped it"})
+    result = json.loads(out)
+    assert result["ok"] is True
+    assert result["status"] == "blocked"
+    assert calls == [(conn, "t_exact", "Itai stopped it")]
+
+
 def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     """Orchestrator profiles (no HERMES_KANBAN_TASK) can still complete
     any task via explicit task_id. The check only applies to workers."""
