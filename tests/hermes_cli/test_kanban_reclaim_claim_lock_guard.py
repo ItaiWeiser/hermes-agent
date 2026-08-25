@@ -287,6 +287,177 @@ def test_manual_fenced_reclaim_clears_only_proven_dead_exact_owner(
 
 
 @darwin_only
+def test_operator_stop_blocks_live_fenced_attempt_without_ready_window(
+    conn,
+    monkeypatch,
+    worker_identity,
+):
+    """An explicit operator stop is one atomic blocked lifecycle action."""
+    task_id, claimed, _raw = create_bound_attempt(
+        conn,
+        leader_identity=worker_identity,
+    )
+
+    state = {"dead": False}
+    monkeypatch.setattr(
+        kb,
+        "_fenced_group_state",
+        lambda _fence: "dead" if state["dead"] else "alive",
+    )
+
+    def terminate(_pgid, _signal):
+        state["dead"] = True
+
+    assert kb.stop_task(
+        conn,
+        task_id,
+        reason="Itai ordered stop",
+        signal_fn=terminate,
+    )
+
+    task = kb.get_task(conn, task_id)
+    assert task.status == "blocked"
+    assert task.block_kind == "needs_input"
+    assert process_tuple(task) == (None, None, None, None, None, None)
+    run = conn.execute(
+        "SELECT status, outcome, ended_at FROM task_runs WHERE id=?",
+        (claimed.current_run_id,),
+    ).fetchone()
+    assert tuple(run) == ("blocked", "blocked", run["ended_at"])
+    assert run["ended_at"] is not None
+    kinds = [
+        row["kind"]
+        for row in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+            (task_id,),
+        )
+    ]
+    assert "reclaimed" not in kinds
+    assert kinds[-1] == "blocked"
+
+
+@darwin_only
+def test_operator_stop_fails_closed_for_foreign_fence(
+    conn,
+    worker_identity,
+):
+    task_id, _claimed, raw = create_bound_attempt(
+        conn,
+        leader_identity=worker_identity,
+    )
+    fence = json.loads(raw)
+    fence["host"] = "some-other-host"
+    foreign = json.dumps(fence, sort_keys=True, separators=(",", ":"))
+    conn.execute(
+        "UPDATE tasks SET worker_fence=? WHERE id=?",
+        (foreign, task_id),
+    )
+    conn.execute(
+        "UPDATE task_runs SET worker_fence=? WHERE task_id=?",
+        (foreign, task_id),
+    )
+    conn.commit()
+    before = logical_board_snapshot(conn)
+    assert not kb.stop_task(
+        conn,
+        task_id,
+        reason="operator stop",
+        signal_fn=lambda *_args: pytest.fail(
+            "foreign fence must never be signalled"
+        ),
+    )
+    assert logical_board_snapshot(conn) == before
+
+
+@darwin_only
+def test_notifier_cursor_claim_is_control_plane_state_during_live_fence(
+    conn,
+    worker_identity,
+):
+    """A live worker fence must not make the trusted notifier warn every tick."""
+    task_id, _claimed, _raw = create_bound_attempt(
+        conn,
+        leader_identity=worker_identity,
+    )
+    cursor = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id=?",
+        (task_id,),
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO kanban_notify_subs "
+        "(task_id, platform, chat_id, thread_id, created_at, last_event_id) "
+        "VALUES (?, 'telegram', 'chat', '', 1, ?)",
+        (task_id, cursor),
+    )
+    conn.commit()
+
+    old_cursor, new_cursor, events = kb.claim_unseen_events_for_sub(
+        conn,
+        task_id=task_id,
+        platform="telegram",
+        chat_id="chat",
+        kinds=["completed", "blocked", "gave_up"],
+    )
+    assert (old_cursor, new_cursor, events) == (cursor, cursor, [])
+
+
+@darwin_only
+def test_operator_stop_pending_is_blocked_and_safely_retryable(
+    conn,
+    monkeypatch,
+    worker_identity,
+):
+    task_id, _claimed, _raw = create_bound_attempt(
+        conn,
+        leader_identity=worker_identity,
+    )
+    state = {"dead": False}
+    monkeypatch.setattr(
+        kb,
+        "_fenced_group_state",
+        lambda _fence: "dead" if state["dead"] else "alive",
+    )
+
+    def denied(_pgid, _signal):
+        raise PermissionError
+
+    assert kb.stop_task(
+        conn,
+        task_id,
+        reason="Itai ordered stop",
+        signal_fn=denied,
+    )
+    pending = kb.get_task(conn, task_id)
+    assert pending.status == "blocked"
+    assert pending.worker_fence is not None
+    spawned = []
+    kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *args, **kwargs: spawned.append((args, kwargs)),
+        max_spawn=1,
+    )
+    assert spawned == []
+
+    def succeeds(_pgid, _signal):
+        state["dead"] = True
+
+    assert kb.stop_task(
+        conn,
+        task_id,
+        reason="retry exact pending stop",
+        signal_fn=succeeds,
+    )
+    stopped = kb.get_task(conn, task_id)
+    assert stopped.status == "blocked"
+    assert process_tuple(stopped) == (None, None, None, None, None, None)
+    block_events = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='blocked'",
+        (task_id,),
+    ).fetchone()[0]
+    assert block_events == 1
+
+
+@darwin_only
 def test_manual_reclaim_cannot_reopen_a_terminal_fenced_outcome(
     conn,
     monkeypatch,
