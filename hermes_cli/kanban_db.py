@@ -381,6 +381,7 @@ REGISTERED_WORKER_DENIED_SURFACES = frozenset(
         "release_stale_claims",
         "reap_terminal_attempt_fences",
         "reclaim_task",
+        "stop_task",
         "reassign_task",
         "enforce_max_runtime",
         "detect_stale_running",
